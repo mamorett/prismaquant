@@ -1,0 +1,265 @@
+"""Architecture profile — PrismQuant's adapter layer between a model
+family's checkpoint conventions and the format-agnostic core pipeline.
+
+Each profile captures three kinds of knowledge:
+
+  1. **Naming**: how checkpoint parameter names map to vLLM's internal
+     Linear qnames at compressed-tensors scheme dispatch, and the regex
+     patterns vLLM uses for per-expert MoE loading.
+
+  2. **Structure**: which Linear groups are fused siblings (q/k/v,
+     gate/up, etc.), what 3D Parameters represent packed MoE experts,
+     whether the architecture has MTP heads.
+
+  3. **MTP construction**: how to stand up an HF-module replica of the
+     architecture's MTP forward (for Fisher probing), and how to load
+     `mtp.*` safetensors into it.
+
+Profiles are picked per-run by `registry.detect_profile(model_path)`
+from HF config + architectures. Unknown architectures fall back to
+`DefaultProfile` which runs the generic path (no fused-sibling
+promotion, no MTP support, plain `model.layers.*` naming).
+"""
+from __future__ import annotations
+
+import json
+import re
+from abc import ABC, abstractmethod
+from pathlib import Path
+
+import torch.nn as nn
+
+
+class ModelProfile(ABC):
+    """Base class for all PrismQuant architecture profiles."""
+
+    # ------------------------------------------------------------
+    # Identity + match
+    # ------------------------------------------------------------
+    @classmethod
+    @abstractmethod
+    def matches(cls, model_type: str, architectures: list[str]) -> bool:
+        """Return True if this profile claims responsibility for the
+        given HF `model_type` / `architectures`."""
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Profile identifier (e.g. 'qwen3_5', 'default')."""
+
+    # ------------------------------------------------------------
+    # Fused-sibling promotion (allocator.py)
+    # ------------------------------------------------------------
+    def fused_sibling_group(self, linear_qname: str) -> str | None:
+        """Return a canonical 'group key' if this Linear belongs to a
+        fused-sibling group (q/k/v/o, gate/up, etc.), otherwise None.
+
+        Example (Qwen3.5):
+          model.layers.3.self_attn.q_proj -> 'model.layers.3.self_attn.qkv'
+          model.layers.3.self_attn.k_proj -> 'model.layers.3.self_attn.qkv'
+          model.layers.3.mlp.gate_proj    -> 'model.layers.3.mlp.gate_up'
+        """
+        return None
+
+    # ------------------------------------------------------------
+    # MoE packing
+    # ------------------------------------------------------------
+    def packed_expert_param_names(self) -> frozenset[str]:
+        """Parameter attribute names (on a `*Experts` module) that hold
+        3D packed MoE weight tensors. Union across all known architectures
+        is a safe default; specific profiles can narrow."""
+        return frozenset({
+            "gate_up_proj", "down_proj",   # Qwen3.5 / 3.6
+            "w1", "w2", "w3",              # Mixtral
+            "gate_proj", "up_proj",        # some HF layouts
+        })
+
+    def per_expert_moe_regex(self) -> str | None:
+        """Regex matching vLLM's per-expert Linear qnames at scheme
+        dispatch time. Added to the config_groups catch-all so every
+        per-expert per-projection tensor picks up the catch-all format
+        without ~30k explicit targets."""
+        return None
+
+    # ------------------------------------------------------------
+    # MTP
+    # ------------------------------------------------------------
+    def has_mtp(self) -> bool:
+        """True if this architecture has Multi-Token-Prediction heads
+        in its checkpoint (`mtp.*` tensors) that PrismQuant can probe
+        and quantize."""
+        return False
+
+    def build_mtp_module(self, text_config) -> nn.Module | None:
+        """Construct an HF-module replica of the MTP forward (mirrors
+        what vLLM's MTP class does at inference time). Return None if
+        `has_mtp()` is False.
+
+        The returned module must be wrappable — after `load_state_dict`
+        with the stripped-prefix MTP weights it should forward a hidden
+        state + next-token embed into the MTP block exactly as vLLM does."""
+        return None
+
+    def load_mtp_state_dict(self, mtp_module: nn.Module,
+                            raw: dict) -> tuple[list[str], list[str]]:
+        """Load raw `mtp.*` tensors (with `mtp.` stripped) into
+        `mtp_module`. Return `(unmatched_keys, module_params_without_weight)`.
+
+        Default implementation uses `mtp_module.load_state_dict(raw, strict=False)`."""
+        mapped: dict = {}
+        for k, v in raw.items():
+            mapped[k] = v
+        sd = mtp_module.state_dict()
+        mapped_filtered = {k: v for k, v in mapped.items() if k in sd}
+        missing = [k for k in mapped if k not in sd]
+        extra = [k for k in sd if k not in mapped_filtered]
+        mtp_module.load_state_dict(mapped_filtered, strict=False)
+        return missing, extra
+
+    def mtp_objective_example(self) -> str:
+        """One-line description of the MTP training objective for the
+        probe's metadata. Generic fallback is fine for most architectures."""
+        return "MTP auxiliary loss (predict token t+k given hidden_t)"
+
+    def per_expert_mtp_regex(self) -> str | None:
+        """Regex matching MTP per-expert Linear qnames at scheme dispatch.
+        Returns None if no MoE MTP in this architecture."""
+        return None
+
+    # ------------------------------------------------------------
+    # Naming remap for compressed-tensors
+    # ------------------------------------------------------------
+    def to_vllm_internal_name(self, checkpoint_name: str) -> str:
+        """Remap a checkpoint parameter name (as stored in safetensors)
+        to the vLLM-internal module qname that `find_matched_target`
+        compares against at scheme dispatch.
+
+        Default: identity. Multimodal / MoE architectures override."""
+        return checkpoint_name
+
+    def source_tensor_name(self, model_qname: str) -> str:
+        """Rewrite an in-memory HF module qname (from `named_parameters`)
+        to the name that should land on disk in the exported
+        safetensors. For multimodal HF checkpoints loaded via
+        AutoModelForCausalLM, the module tree is flat (`model.layers.X.*`)
+        but the source safetensors use the multimodal convention
+        (`model.language_model.layers.X.*`) that vLLM expects.
+
+        Default: identity. Multimodal architectures override."""
+        return model_qname
+
+    # ------------------------------------------------------------
+    # Source passthrough + text-only staging
+    # ------------------------------------------------------------
+    def source_passthrough_prefixes(self) -> tuple[str, ...]:
+        """Prefixes of checkpoint keys that should be copied from the
+        source checkpoint as-is (typically visual encoder + MTP when
+        not being quantized)."""
+        return ()
+
+    def stage_text_only_strip_keys(self) -> tuple[str, ...]:
+        """HF config keys to drop when creating a text-only staged
+        config for probe/cost model loading (e.g. `vision_config` on
+        multimodal models so `AutoModelForCausalLM` can load)."""
+        return ("vision_config", "audio_config", "speech_config")
+
+    # ------------------------------------------------------------
+    # Extended shard regexes (incremental_probe)
+    # ------------------------------------------------------------
+    def extended_shard_regexes(self, model_path: str,
+                               layers_per_shard: int,
+                               *, include_body: bool = True,
+                               include_mtp: bool = True,
+                               include_visual: bool = True,
+                               include_lm_head: bool = True) -> list[str]:
+        """Return the list of Linear-name regexes covering every shard
+        of the probe — body, MTP, visual, lm_head.
+
+        Reads the SOURCE config (not a staged copy) so vision/MTP
+        metadata that text-only staging might strip remains visible."""
+        src_cfg_path = Path(model_path) / "config.json"
+        with open(src_cfg_path) as f:
+            cfg = json.load(f)
+        text_cfg = cfg.get("text_config", cfg)
+        vis_cfg = cfg.get("vision_config", {})
+
+        regexes: list[str] = []
+        if include_body:
+            n_body = int(text_cfg.get("num_hidden_layers",
+                                       cfg.get("num_hidden_layers", 0)))
+            regexes.extend(
+                _build_layer_shard_regexes(n_body, layers_per_shard,
+                                           layer_prefix=self.body_layer_prefix()))
+        if include_mtp and self.has_mtp():
+            n_mtp = int(self.mtp_layer_count(cfg) or 0)
+            if n_mtp > 0:
+                regexes.extend(
+                    _build_layer_shard_regexes(n_mtp, layers_per_shard,
+                                               layer_prefix=self.mtp_layer_prefix()))
+        if include_visual and self.visual_config_key():
+            n_vis = int(vis_cfg.get("depth")
+                        or vis_cfg.get("num_hidden_layers") or 0)
+            if n_vis > 0:
+                regexes.extend(
+                    _build_layer_shard_regexes(n_vis,
+                                               max(layers_per_shard, 4),
+                                               layer_prefix=self.visual_layer_prefix()))
+        if include_lm_head:
+            regexes.append(rf"^{re.escape(self.lm_head_name())}$")
+        return regexes
+
+    def body_layer_prefix(self) -> str:
+        """Prefix used for body-layer names in the checkpoint (before
+        the numeric index)."""
+        return "model.layers"
+
+    def mtp_layer_prefix(self) -> str:
+        """Prefix used for MTP-layer names in the checkpoint."""
+        return "mtp.layers"
+
+    def visual_layer_prefix(self) -> str | None:
+        """Prefix used for visual-encoder block names, or None if this
+        model has no visual encoder."""
+        return None
+
+    def visual_config_key(self) -> str | None:
+        """Top-level HF config key under which the vision_config dict
+        lives, or None if this model has no visual encoder."""
+        return None
+
+    def lm_head_name(self) -> str:
+        """Qualified name of the lm_head Linear in the checkpoint."""
+        return "lm_head"
+
+    def mtp_layer_count(self, cfg: dict) -> int:
+        """Count of MTP layers from the HF config. Fall back to
+        scanning the safetensors index via `_count_mtp_layers_from_safetensors`
+        in subclasses when the config doesn't report it."""
+        text = cfg.get("text_config", cfg)
+        return int(
+            text.get("num_nextn_predict_layers")
+            or cfg.get("num_nextn_predict_layers")
+            or text.get("num_mtp_layers")
+            or cfg.get("num_mtp_layers")
+            or text.get("mtp_num_hidden_layers")
+            or cfg.get("mtp_num_hidden_layers")
+            or 0
+        )
+
+
+# ---------------------------------------------------------------------------
+# Shared helper
+# ---------------------------------------------------------------------------
+def _build_layer_shard_regexes(num_layers: int,
+                               layers_per_shard: int,
+                               *, layer_prefix: str) -> list[str]:
+    out: list[str] = []
+    for start in range(0, num_layers, layers_per_shard):
+        end = min(start + layers_per_shard, num_layers)
+        if end - start == 1:
+            body = rf"{re.escape(layer_prefix)}\.{start}\."
+        else:
+            idxs = "|".join(str(i) for i in range(start, end))
+            body = rf"{re.escape(layer_prefix)}\.(?:{idxs})\."
+        out.append(body)
+    return out

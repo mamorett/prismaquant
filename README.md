@@ -20,6 +20,103 @@ budget. It produces a `compressed-tensors` checkpoint that vLLM serves
 - Qwen3.5 / 3.6 fused-sibling groups (q/k/v, gate/up, `in_proj_qkv+z`,
   `in_proj_a+b`) are promoted to share a `weight_global_scale` so vLLM's
   fused loader doesn't warn about scale divergence.
+- **Zero vLLM patches.** The output of PrismQuant is a standard
+  `compressed-tensors` checkpoint, parsed by vLLM's stock loader. No
+  custom kernels, no forked serving stack. `vllm serve` the artifact
+  and go.
+
+## Motivation
+
+Naive post-training quantization has two failure modes, both caused by
+the same underlying problem: the quantizer doesn't know which parts of
+the model are sensitive.
+
+1. **Over-preservation.** Tools without a sensitivity model leave
+   large chunks in BF16 or FP8 "to be safe" — usually `lm_head`, the
+   attention Q/K/V, `down_proj`, and any Linear the authors saw fail
+   once. Every one of those is a conservative guess, not a measured
+   decision. The result is a 5 – 6 bpp artifact that could have been
+   4.2 – 4.5 bpp with no quality loss.
+
+2. **Over-aggression.** The same tools, run with a tighter budget,
+   cast those same genuinely-sensitive Linears to NVFP4 anyway because
+   they have no way to tell "this 4-bit op will cost you 3 points of
+   MMLU" apart from "this 4-bit op will cost you 0.1 points of MMLU."
+   Quality collapses before the bit-budget savings are realized.
+
+Both failure modes waste the most precious resource in local-LLM
+serving: **DRAM capacity and bandwidth**. On a DGX Spark (128 GB
+unified memory, Blackwell SM121 with NVFP4/MXFP8 tensor cores), every
+byte the KV cache doesn't spend on weights is a byte available for
+context length, batch size, or the next model in the rotation. Getting
+the weight format right on a per-Linear basis is the difference between
+running one model at high quality and running three.
+
+PrismQuant replaces those heuristics with a closed-form per-Linear
+cost estimate:
+
+    Δloss ≈ 0.5 · H_trace · MSE_W
+
+where `H_trace` is the empirical Fisher diagonal trace (captured once
+via hooks during a short calibration pass) and `MSE_W` is the measured
+per-format round-trip error on that Linear's actual weights. The
+allocator solves a standard multi-choice knapsack over those estimates
+under a total-bit budget. **Each bit goes where it buys the most
+likelihood.** The result on Qwen3.6-35B-A3B at 4.75 bpp: 124 Linears in
+NVFP4, 26 in MXFP8, 252 in BF16 — a distribution no hand-crafted
+heuristic would produce, and one that serves natively in vLLM with
+coherent generation and valid MTP speculative decoding.
+
+### Contrast with Intel AutoRound (Int4)
+
+Intel's AutoRound is a strong baseline for weight-only INT4
+quantization. We ran it on the same model class earlier in this
+project, and the quality gap we observed wasn't because AutoRound's
+rounding algorithm was worse — it's a principled sign-gradient-descent
+search over rounding decisions and it produces genuinely good per-layer
+integer packings. The gap was structural: **AutoRound quantizes the
+whole model to the same format.** Every Linear becomes INT4, because
+that's the API. There's no way to tell it "this specific `down_proj` in
+layer 23 is curvature-sensitive; leave it in BF16 and spend those 12
+bits somewhere less sensitive."
+
+PrismQuant operates one level up. It's not a rounding algorithm — it's
+a format **allocator** that composes on top of RTN, AutoRound, GPTQ, or
+any other per-Linear quantizer you want to plug into
+`format_registry.py`. The `FormatSpec` for each format carries its own
+`quantize_dequantize` function, so you can drop an AutoRound-generated
+codebook into the pipeline and still get per-Linear mixed-precision
+selection. Combined with the measured-vs-analytical cost model, that
+makes the bit budget go farther at the same point on the
+quality-vs-size Pareto curve.
+
+### Working within vLLM's constraints
+
+vLLM's compressed-tensors loader accepts a specific set of
+format/strategy combinations (NVFP4 `tensor_group g=16`, FP8 `channel`
+W8A8, BF16 passthrough, and a few more). PrismQuant's allocator is
+explicitly aware of those constraints — you can't ask for a format
+vLLM can't serve. That's why the initial release targets **exactly the
+subset vLLM supports natively** (NVFP4 + FP8 W8A8 + BF16) and requires
+**zero vLLM changes**. If vLLM's constraints change, the
+`format_registry.py` adapts; until they do, every PrismQuant artifact
+is a drop-in `--quantization compressed-tensors` target.
+
+The bigger opportunity — and the immediate next roadmap item — is
+**targeting a fixed memory footprint** rather than a fixed bits-per-parameter.
+Currently you ask the allocator for `--target-bits 4.75`. What you
+actually want to ask it is "make the artifact fit 24 GB with the KV
+budget I need at 8K context." The Pareto curve PrismQuant already
+computes has exactly this information (bits vs. Δloss vs. disk size).
+Wiring a size-target mode on top is a day of work, not a research
+project, and unlocks direct comparisons like:
+
+  - **3090 (24 GB)** — what's the best 24 B-parameter MoE we can ship?
+  - **DGX Spark (128 GB)** — how large can an MoE get before the KV
+    budget dominates?
+
+Once that lands, PrismQuant goes from "allocator that optimizes bpp"
+to "allocator that fits your hardware."
 
 ## Validated result
 
@@ -367,20 +464,196 @@ host.
 
 ## Roadmap
 
-- **Model-profile registry** — auto-derive fused-sibling patterns,
-  packed-expert names, and layer-type info from vLLM's model registry
-  + HF config, so PrismQuant works on arbitrary architectures without
-  hand-editing allocator patterns.
-- **Multimodal calibration** — load `ForConditionalGeneration`, run
-  image+text pairs through a multimodal processor, so visual encoder
-  blocks get real Fisher stats.
-- **MXFP6 serving** — enable once vLLM kernels land.
-- **Speculative-decoding acceptance-rate tuning** — per-MTP-Linear
-  format allocation that jointly optimizes target model quality and
-  MTP-draft acceptance rate.
+Immediate priorities (next few weeks):
+
+- **MiniMax M2.7 on a single DGX Spark.** MiniMax M2.7 is ~280 B
+  parameters — it does not fit in 128 GB at BF16, at FP8, or at a
+  uniform 4-bit quant with meaningful KV headroom. PrismQuant's
+  mixed-format allocator gets close: if we can land an average
+  ~3.4 bpp recipe with the sensitive paths in NVFP4 and most experts
+  in 3-bit, the model fits and the KV cache has room to breathe. The
+  blockers are `3-bit support` and a size-targeting allocator mode
+  (below).
+- **3-bit format support.** Requires registering a 3-bit
+  `FormatSpec` in `format_registry.py` and picking an underlying
+  kernel path that vLLM can serve. Candidates: GPTQ 3-bit via Marlin
+  (available now; slower), or native 3-bit W3A16 when/if
+  compressed-tensors ships a dispatcher.
+- **MXFP6 (E3M2 and E2M3).** Blackwell tensor cores support MXFP6
+  natively — the hardware path is free. vLLM doesn't yet ship a
+  serving kernel for it, but the quantization side works fine today
+  (`format_registry.py` has both variants registered). Enable in the
+  serving path once the vLLM dispatcher lands.
+- **Size-targeting allocator mode.** `--target-bytes 24_000_000_000
+  --kv-budget 8192` instead of `--target-bits 4.75`. The allocator
+  already computes the full Pareto curve; this is a thin wrapper that
+  picks the knee matching a hardware constraint. Unlocks direct
+  comparisons at 3090 (24 GB), 5090 (32 GB), and Spark (128 GB)
+  memory targets.
+
+Broader research directions:
+
+- **Per-MTP-Linear acceptance-rate tuning** — jointly optimize
+  target-model quality and MTP-draft token acceptance rate. Today MTP
+  Linears get assigned using the same body loss model; a more
+  sophisticated allocator would weight MTP sensitivity by the draft's
+  contribution to speculative-decoding throughput.
+- **Multimodal calibration** — load
+  `ForConditionalGeneration`, drive image + text pairs through the
+  multimodal processor so visual encoder blocks get real Fisher stats
+  instead of BF16 passthrough.
+- **Model-profile registry completion** — the `model_profiles/`
+  package is in place and handles Qwen3.5/3.6 end-to-end; add
+  first-class profiles for DeepSeek-V3 / V3.1, GLM-4, MiniMax, and
+  Llama-family MoE so PrismQuant works out of the box on those
+  architectures.
+- **Sparse-outlier co-quantization.** Borrow from SpQR / SqueezeLLM:
+  extract the top-k outlier weights per Linear, serve them as a
+  sparse BF16 side-table, quantize the dense remainder more
+  aggressively. Would push the 4.75 bpp frontier down to ~4.0 bpp
+  with the same quality.
+- **Interaction-aware refinement at scale.** We already have sparse
+  pairwise interaction measurement + local quadratic refinement
+  (`measure_interactions.py` + `quadratic_refine_allocator.py`).
+  Scaling these to cover the whole model without the memory cost of
+  a dense pairwise probe is open.
+- **Serving-aware calibration.** The calibration set right now is
+  generic ultrachat; domain-targeted calibration (code, reasoning,
+  multilingual) should Pareto-dominate for task-specific deployments.
+
+## References
+
+PrismQuant stands on the shoulders of a decade of mixed-precision
+quantization research. The closed-form cost model, the Fisher-diagonal
+sensitivity estimator, the multi-choice knapsack formulation, and the
+format registry are all assembled from published ideas. Key influences:
+
+**Mixed-precision bit allocation**
+
+- Wang, K., Liu, Z., Lin, Y., Lin, J., & Han, S. *HAQ: Hardware-Aware
+  Automated Quantization with Mixed Precision.* CVPR 2019.
+- Dong, Z., Yao, Z., Gholami, A., Mahoney, M. W., & Keutzer, K.
+  *HAWQ: Hessian AWare Quantization of Neural Networks with
+  Mixed-Precision.* ICCV 2019.
+- Dong, Z., Yao, Z., Arfeen, D., Gholami, A., Mahoney, M. W., &
+  Keutzer, K. *HAWQ-V2: Hessian Aware Trace-Weighted Quantization of
+  Neural Networks.* NeurIPS 2020.
+- Yao, Z., Dong, Z., Zheng, Z., Gholami, A., Yu, J., Tan, E., et al.
+  *HAWQ-V3: Dyadic Neural Network Quantization.* ICML 2021.
+- Chen, W., Wang, P., & Cheng, J. *Towards Mixed-Precision
+  Quantization of Neural Networks via Constrained Optimization.*
+  ICCV 2021.
+
+**Post-training quantization and rounding**
+
+- Frantar, E., Ashkboos, S., Hoefler, T., & Alistarh, D. *GPTQ:
+  Accurate Post-Training Quantization for Generative Pre-trained
+  Transformers.* ICLR 2023.
+- Frantar, E. & Alistarh, D. *Optimal Brain Compression: A Framework
+  for Accurate Post-Training Quantization and Pruning.* NeurIPS 2022.
+- Cheng, W., Zhang, W., Shen, H., Cai, Y., He, X., & Lv, K.
+  *Optimize Weight Rounding via Signed Gradient Descent for the
+  Quantization of LLMs (AutoRound).* arXiv 2309.05516, 2023.
+- Lin, J., Tang, J., Tang, H., Yang, S., Chen, W.-M., Wang, W.-C.,
+  et al. *AWQ: Activation-aware Weight Quantization for LLM
+  Compression and Acceleration.* MLSys 2024.
+- Nagel, M., Amjad, R., van Baalen, M., Louizos, C., & Blankevoort,
+  T. *Up or Down? Adaptive Rounding for Post-Training Quantization
+  (AdaRound).* ICML 2020.
+- Li, Y., Gong, R., Tan, X., Yang, Y., Hu, P., Zhang, Q., et al.
+  *BRECQ: Pushing the Limit of Post-Training Quantization by Block
+  Reconstruction.* ICLR 2021.
+
+**Rotation / pre-conditioning**
+
+- Ashkboos, S., Mohtashami, A., Croci, M. L., Li, B., Cameron, P.,
+  Jaggi, M., et al. *QuaRot: Outlier-Free 4-Bit Inference in Rotated
+  LLMs.* NeurIPS 2024.
+- Liu, Z., Zhao, C., Fedorov, I., Soran, B., Choudhary, D.,
+  Krishnamoorthi, R., et al. *SpinQuant: LLM Quantization with
+  Learned Rotations.* 2024.
+- Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J., & Han, S.
+  *SmoothQuant: Accurate and Efficient Post-Training Quantization for
+  Large Language Models.* ICML 2023.
+- Dettmers, T., Lewis, M., Belkada, Y., & Zettlemoyer, L. *LLM.int8():
+  8-bit Matrix Multiplication for Transformers at Scale.* NeurIPS
+  2022.
+
+**Low-bit and learned-codebook quantization**
+
+- Chee, J., Cai, Y., Kuleshov, V., & De Sa, C. *QuIP: 2-Bit
+  Quantization of Large Language Models With Guarantees.* NeurIPS
+  2023.
+- Tseng, A., Chee, J., Sun, Q., Kuleshov, V., & De Sa, C. *QuIP#:
+  Even Better LLM Quantization with Hadamard Incoherence and Lattice
+  Codebooks.* ICML 2024.
+- Kim, S., Hooper, C., Gholami, A., Dong, Z., Li, X., Shen, S.,
+  et al. *SqueezeLLM: Dense-and-Sparse Quantization.* ICML 2024.
+- Dettmers, T., Svirschevski, R., Egiazarian, V., Kuznedelev, D.,
+  Frantar, E., Ashkboos, S., et al. *SpQR: A Sparse-Quantized
+  Representation for Near-Lossless LLM Weight Compression.* ICLR
+  2024.
+- Shao, W., Chen, M., Zhang, Z., Xu, P., Zhao, L., Li, Z., et al.
+  *OmniQuant: Omnidirectionally Calibrated Quantization for Large
+  Language Models.* ICLR 2024.
+
+**MoE quantization**
+
+- Kim, Y., Henry, R., Imani, H., Saberian, S., Sefidgaran, M.,
+  et al. *MoQE: Mixture of Quantized Experts for Efficient
+  Mixture-of-Experts.* 2023.
+
+**MTP / speculative decoding**
+
+- DeepSeek-AI. *DeepSeek-V3 Technical Report.* 2024 (MTP auxiliary
+  objective, adopted here for the MTP Fisher probe).
+- Leviathan, Y., Kalman, M., & Matias, Y. *Fast Inference from
+  Transformers via Speculative Decoding.* ICML 2023.
+- Cai, T., Li, Y., Geng, Z., Peng, H., Lee, J. D., Chen, D., &
+  Dao, T. *Medusa: Simple LLM Inference Acceleration Framework with
+  Multiple Decoding Heads.* 2024.
+
+**KV cache quantization**
+
+- Liu, Z., Yuan, J., Jin, H., Zhong, S., Xu, Z., Braverman, V.,
+  et al. *KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV
+  Cache.* 2024.
+- Agarwal, V. (vLLM). *TurboQuant: 2-bit KV Cache Compression with
+  Hadamard Rotation + Lloyd-Max Scalar Quantization.* vLLM PR #38479,
+  2026. *(Waiting on hybrid-attention/mamba support for Qwen3.6.)*
+
+**Formats**
+
+- Open Compute Project (OCP). *Microscaling Formats (MX)
+  Specification, Rev 1.0.* 2023.
+- NVIDIA. *Blackwell GPU Architecture and NVFP4 Format.* 2024.
+- Neural Magic / vLLM Project. *compressed-tensors: A Universal
+  Format for Quantized Model Serving.* 2024.
+
+**Pareto-knee detection**
+
+- Satopaa, V., Albrecht, J., Irwin, D., & Raghavan, B. *Finding a
+  'Kneedle' in a Haystack: Detecting Knee Points in System Behavior.*
+  ICDCS Workshops 2011.
+
+**Classical bit allocation (water-filling)**
+
+- Cover, T. M., & Thomas, J. A. *Elements of Information Theory*,
+  Chapter 13 (Rate-Distortion), 2nd ed. Wiley, 2006.
 
 ## Citation
 
 If you use PrismQuant in research, please cite this repository. A
-preprint covering the closed-form allocator math, the `_GradNormCapture`
-MoE Fisher estimator, and the MTP quantization path is forthcoming.
+preprint covering the closed-form allocator math, the
+`_GradNormCapture` MoE Fisher estimator, and the MTP quantization path
+is forthcoming.
+
+```bibtex
+@software{prismquant2026,
+  title        = {PrismQuant: Mixed-Precision Quantization via
+                  Fisher-Weighted Bit Allocation},
+  author       = {Tand, Rob and contributors},
+  year         = {2026},
+  url          = {https://github.com/RobTand/PrismQuant},
+}
+```

@@ -705,95 +705,38 @@ FORMAT_SCHEME = {
 }
 
 
-# Per-expert MoE pattern matching every per-expert per-projection
-# Linear vLLM constructs from compressed MoE checkpoints. This single
-# regex covers ~30k tensors that would otherwise need explicit entries.
-# Constrained to `language_model.model.layers.X.mlp.experts.Y.{gate,up,down}_proj`
-# so it doesn't accidentally match dense Linears or visual encoder
-# blocks.
-PER_EXPERT_MOE_REGEX = (
-    r"re:^language_model[.]model[.]layers[.][0-9]+"
-    r"[.]mlp[.]experts[.][0-9]+[.](gate|up|down)_proj$"
-)
-
-# Per-expert regex for MTP — vLLM constructs MTP experts as
-# `mtp.layers.X.mlp.experts.Y.{gate,up,down}_proj` (the prefix is `mtp`
-# because Qwen3_5MTP passes prefix="mtp" to its inner predictor, and
-# that prefix is NOT remapped at scheme-dispatch time).
-MTP_PER_EXPERT_REGEX = (
-    r"re:^mtp[.]layers[.][0-9]+"
-    r"[.]mlp[.]experts[.][0-9]+[.](gate|up|down)_proj$"
-)
-
-
-def _to_vllm_internal_name(name: str) -> str:
-    """Apply vLLM's name mappers so module names line up with what
-    `find_matched_target` compares against at scheme-dispatch time.
-
-    Body (qwen3_5 multimodal class, qwen3_5.py):
-      `model.visual.`        → `visual.`
-      `lm_head.`             → `language_model.lm_head.`
-      `model.language_model.`→ `language_model.model.`
-
-    MTP: vLLM's `Qwen3_5MTP` passes `prefix="mtp"` when building the inner
-    `Qwen3_5MultiTokenPredictor`, so every MTP Linear is constructed with
-    a `mtp.*` prefix (e.g. `mtp.fc`, `mtp.layers.0.self_attn.q_proj`).
-    That prefix is what `find_matched_target` compares against. The
-    `mtp.→model.` string replacement in `qwen3_5_mtp.load_weights` is a
-    *checkpoint-key* remap applied BEFORE weight loading, AFTER scheme
-    dispatch — so it does NOT affect target matching. Leave MTP names
-    as-is.
-
-    We accept recipe keys in any of these upstream conventions:
-      - body text-only probe form  `model.layers.X.*`
-      - body HF multimodal source  `model.language_model.layers.X.*`
-      - MTP probe / source form    `mtp.layers.X.*` (preserved)
-      - visual source              `model.visual.blocks.X.*`
-      - `lm_head`
-    """
-    # Body — multimodal source form.
-    if name.startswith("model.language_model."):
-        return "language_model.model." + name[len("model.language_model."):]
-    # Visual encoder.
-    if name.startswith("model.visual."):
-        return "visual." + name[len("model.visual."):]
-    # MTP — preserve the `mtp.` prefix. See docstring.
-    if name.startswith("mtp."):
-        return name
-    # Body — text-only recipe form.
-    if (name.startswith("model.layers.")
-            or name.startswith("model.embed_tokens")
-            or name.startswith("model.norm")
-            or name == "model"):
-        return "language_model.model." + name[len("model."):]
-    # lm_head — qwen3_5 multimodal class maps under language_model.
-    if name == "lm_head" or name.startswith("lm_head."):
-        return "language_model." + name
-    return name
-
-
 def build_quantization_config(
     assignment: dict[str, str],
     bf16_passthrough: set[str],
     extra_ignore: Iterable[str] = (),
+    *,
+    profile: "ModelProfile | None" = None,
 ) -> dict:
     """Emit a `quantization_config` dict with explicit per-name targets
     grouped by format. Targets and ignore are remapped to vLLM's
-    internal naming so `find_matched_target` matches.
+    internal naming via the supplied `profile` so `find_matched_target`
+    matches.
 
     `extra_ignore` is for module qnames that aren't in the recipe at
     all but should be excluded from any catch-all group (e.g. routers).
     The catch-all default group is the format with the most non-BF16
     members (typically NVFP4).
+
+    `profile` controls the architecture-specific bits: name remap,
+    per-expert MoE / MTP regexes. Defaults to `DefaultProfile()` (plain
+    names, no catch-all regexes) when omitted.
     """
+    from .model_profiles import DefaultProfile
+    profile = profile or DefaultProfile()
+
     by_fmt: dict[str, list[str]] = {}
     ignore: list[str] = []
     for n in bf16_passthrough:
-        ignore.append(_to_vllm_internal_name(n))
+        ignore.append(profile.to_vllm_internal_name(n))
     for n in extra_ignore:
-        ignore.append(_to_vllm_internal_name(n))
+        ignore.append(profile.to_vllm_internal_name(n))
     for name, fmt in sorted(assignment.items()):
-        vllm_name = _to_vllm_internal_name(name)
+        vllm_name = profile.to_vllm_internal_name(name)
         if fmt == "BF16":
             ignore.append(vllm_name)
             continue
@@ -821,13 +764,16 @@ def build_quantization_config(
         # and short-circuits vLLM's fused-layer regex resolution, which
         # is needed to route the explicit per-component MXFP8 targets
         # to vLLM's fused parameter (in_proj_qkvz, qkv_proj, etc.).
-        # We additionally add a single pattern regex for per-expert
-        # MoE Linears so we don't have to enumerate ~30k entries.
+        # We additionally add architecture-specific per-expert regexes
+        # from the profile so ~30k per-expert MoE entries don't need
+        # explicit enumeration.
         explicit = sorted(by_fmt[catchall])
-        scheme["targets"] = (
-            [_explicit_regex(n) for n in explicit]
-            + [PER_EXPERT_MOE_REGEX, MTP_PER_EXPERT_REGEX]
-        )
+        expert_regexes = []
+        if (r := profile.per_expert_moe_regex()) is not None:
+            expert_regexes.append(r)
+        if (r := profile.per_expert_mtp_regex()) is not None:
+            expert_regexes.append(r)
+        scheme["targets"] = [_explicit_regex(n) for n in explicit] + expert_regexes
         config_groups[f"group_{idx}"] = scheme
 
     return {
@@ -1142,9 +1088,12 @@ def write_config_with_quantization(
     bf16_passthrough: set[str],
     extra_ignore: Iterable[str] = (),
 ) -> None:
+    from .model_profiles import detect_profile
+    profile = detect_profile(src_model)
     src_cfg_path = Path(src_model) / "config.json"
     cfg = json.load(open(src_cfg_path))
-    qc = build_quantization_config(assignment, bf16_passthrough, extra_ignore)
+    qc = build_quantization_config(assignment, bf16_passthrough,
+                                   extra_ignore, profile=profile)
     if qc:
         cfg["quantization_config"] = qc
     with open(out_dir / "config.json", "w") as f:
