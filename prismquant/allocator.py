@@ -88,56 +88,65 @@ from . import format_registry as fr
 
 
 # ---------------------------------------------------------------------------
-# Fused-projection sibling detection (general)
+# Fused-projection sibling detection
 # ---------------------------------------------------------------------------
-_FUSED_PATTERNS = [
-    # Standard HF self-attention
-    (r"^(?P<pre>.+)\.self_attn\.(?P<sib>q_proj|k_proj|v_proj|o_proj)$",
-     ("q_proj", "k_proj", "v_proj"), "self_attn"),
-    # Standard HF MLP
-    (r"^(?P<pre>.+)\.mlp\.(?P<sib>gate_proj|up_proj)$",
-     ("gate_proj", "up_proj"), "mlp"),
-    # Legacy Mixtral/Mistral
-    (r"^(?P<pre>.+)\.(?P<sib>w1|w3)$",
-     ("w1", "w3"), "w1w3"),
-    # Legacy PaLM-style
-    (r"^(?P<pre>.+)\.(?P<sib>gate|up)_proj$",
-     ("gate_proj", "up_proj"), "gate_up_alt"),
-    # Qwen3.6 hybrid linear-attention: vLLM fuses in_proj_qkv + in_proj_z
-    # into a single `in_proj_qkvz` parameter, so they must share format.
-    (r"^(?P<pre>.+)\.linear_attn\.(?P<sib>in_proj_qkv|in_proj_z)$",
-     ("in_proj_qkv", "in_proj_z"), "linear_attn_qkvz"),
-    # Qwen3.6 also fuses in_proj_a + in_proj_b into `in_proj_ba`.
-    (r"^(?P<pre>.+)\.linear_attn\.(?P<sib>in_proj_a|in_proj_b)$",
-     ("in_proj_a", "in_proj_b"), "linear_attn_ba"),
-]
+# Profile-driven: we group Linears by the key returned by
+# `profile.fused_sibling_group(qname)`. Profiles default-derive that
+# from the matching vLLM class's `packed_modules_mapping` attribute,
+# so adding new architectures doesn't require new allocator code.
+
+def _group_by_profile(names, profile) -> dict[str, list[str]]:
+    """Group Linear names by the profile's fused-sibling key. Names
+    that don't belong to any fused group are returned with their own
+    unique key so they pass through the promotion logic untouched."""
+    groups: dict[str, list[str]] = {}
+    for name in names:
+        key = profile.fused_sibling_group(name) if profile is not None else None
+        if key is None:
+            continue
+        groups.setdefault(key, []).append(name)
+    return groups
 
 
-def fused_siblings(name: str) -> tuple[tuple[str, ...], str] | None:
-    for pat, members, kind in _FUSED_PATTERNS:
-        m = re.search(pat, name)
-        if m:
-            pre = m.group("pre")
-            parent = name[: name.rindex(m.group("sib"))]
-            # Reconstruct all sibling names that should be promoted together
-            sibs = tuple(f"{parent}{s}" for s in members)
-            return sibs, kind
-    return None
+def fused_siblings(name: str, profile=None) -> tuple[tuple[str, ...], str] | None:
+    """Legacy scalar sibling lookup — resolves a single Linear to its
+    fused group + the group's "kind" label. Kept for backward
+    compatibility; `_group_by_profile` is the path new code should use."""
+    if profile is None:
+        # Fall back to the default profile — still auto-derives from
+        # the vLLM class if one is available.
+        from .model_profiles import DefaultProfile
+        profile = DefaultProfile()
+    key = profile.fused_sibling_group(name)
+    if key is None:
+        return None
+    # Return a single-element sibling tuple (the allocator's promote_fused
+    # fills in the full group from all tracked names that share `key`
+    # via _group_by_profile; this legacy path only needs enough info
+    # for a single-element grouping).
+    return (name,), key
 
 
 def promote_fused(assignment: dict[str, str],
-                  format_rank: dict[str, int]) -> dict[str, str]:
-    """After per-Linear selection, bump each fused group's siblings to the
-    highest-rank format picked for any group member."""
+                  format_rank: dict[str, int],
+                  profile=None) -> dict[str, str]:
+    """After per-Linear selection, bump each fused group's siblings to
+    the highest-rank format picked for any group member.
+
+    Uses `profile.fused_sibling_group(qname)` to decide which Linears
+    belong to the same fused group. The profile default-derives its
+    groups from vLLM's `packed_modules_mapping`, so arch-specific
+    knowledge about fused tensors lives in one place (vLLM's model
+    class) rather than in PrismQuant's allocator."""
+    if profile is None:
+        from .model_profiles import DefaultProfile
+        profile = DefaultProfile()
     out = dict(assignment)
-    groups: dict[tuple, list[str]] = defaultdict(list)
-    for name in assignment:
-        sib = fused_siblings(name)
-        if sib is not None:
-            sibs, kind = sib
-            groups[sibs].append(name)
-    for sibs, members_present in groups.items():
-        # Only consider siblings we actually have allocations for
+    groups = _group_by_profile(assignment.keys(), profile)
+    for members_present in groups.values():
+        if len(members_present) < 2:
+            # A group of 1 is a singleton — nothing to promote to.
+            continue
         ranks = [format_rank[out[m]] for m in members_present]
         best = max(ranks)
         best_fmt = next(k for k, v in format_rank.items() if v == best)
@@ -158,6 +167,7 @@ def solve_with_promotion(
     no_fused_promote: bool = False,
     overshoot_tolerance: float = 0.01,
     max_iters: int = 6,
+    profile=None,
 ) -> tuple[dict[str, str] | None, float]:
     """Solve the allocation, promote fused siblings, and re-solve with a
     tightened target if promotion blew past the budget.
@@ -181,7 +191,7 @@ def solve_with_promotion(
         if assign is None:
             return last_assign, last_achieved
         if not no_fused_promote:
-            assign = promote_fused(assign, format_rank)
+            assign = promote_fused(assign, format_rank, profile=profile)
         achieved, _ = compute_achieved(stats, assign, format_specs)
         last_assign = assign
         last_achieved = achieved
@@ -271,9 +281,18 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
             entry = costs[name].get(spec.name)
             if entry is None or "error" in entry:
                 continue
-            weight_mse = float(entry.get("weight_mse", 0.0))
             gain = float(gains.get(spec.name, 1.0))
-            predicted = predicted_dloss(h_trace, weight_mse, gain=gain)
+            # Prefer the full per-weight Δloss `0.5 · <H_full, MSE_W_full>`
+            # emitted by measure_quant_cost when h_detail was available.
+            # Falls back to the scalar proxy `0.5 · h_trace · weight_mse`
+            # for legacy cost pickles. Both are scalars with units of Δloss,
+            # so the knapsack DP treats them interchangeably — the full
+            # form is just a sharper estimator.
+            if "predicted_dloss" in entry:
+                predicted = float(entry["predicted_dloss"]) * gain
+            else:
+                weight_mse = float(entry.get("weight_mse", 0.0))
+                predicted = predicted_dloss(h_trace, weight_mse, gain=gain)
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=spec.effective_bits_for_shape(shape),
@@ -436,16 +455,21 @@ def aggregate_moe_candidates(
                 costs[m_][spec.name]["output_mse"] for m_ in available_members
             ) / len(available_members)
 
-            # True summed Δloss across all members at format f, using the
-            # closed-form per-(layer, format) term.
+            # True summed Δloss across all members at format f. Uses the
+            # full per-weight Fisher `predicted_dloss` from cost.pkl when
+            # available (sharper), falls back to the scalar-proxy
+            # `0.5 · h_trace · weight_mse` for legacy cost pickles.
             sum_pred = 0.0
             for m_ in members:
                 c = costs.get(m_, {}).get(spec.name)
                 if c is None or "error" in c:
                     c = {"weight_mse": mean_weight_mse,
                          "output_mse": mean_output_mse}
-                h_i = stats[m_]["h_trace"]
-                sum_pred += 0.5 * h_i * float(c["weight_mse"])
+                if "predicted_dloss" in c:
+                    sum_pred += float(c["predicted_dloss"])
+                else:
+                    h_i = stats[m_]["h_trace"]
+                    sum_pred += 0.5 * h_i * float(c["weight_mse"])
 
             # Invert to an effective per-element MSE so build_candidates'
             # formula 0.5 · sum_h · effective_mse · α_f reproduces sum_pred.
@@ -458,6 +482,7 @@ def aggregate_moe_candidates(
                 "weight_mse": effective_mse,
                 "output_mse": mean_output_mse,    # diagnostic only
                 "rel_output_mse": mean_output_mse,
+                "predicted_dloss": sum_pred,       # exact summed Δloss
             }
         costs_ext[super_name] = super_cost
 
@@ -711,6 +736,23 @@ def main():
         os.environ["OMP_NUM_THREADS"] = str(args.threads)
         os.environ["MKL_NUM_THREADS"] = str(args.threads)
 
+    # Detect the model profile from the probe's metadata. The probe
+    # writes `meta.model` when it runs, so we can look up the HF
+    # config at that path and map it to a registered ModelProfile.
+    # Profile governs fused-sibling promotion (allocator's
+    # `promote_fused`) and the vLLM-internal name remap
+    # (`build_quantization_config` via export_native_compressed).
+    from .model_profiles import detect_profile, DefaultProfile
+    model_profile = DefaultProfile()
+    with open(args.probe, "rb") as f:
+        _probe_peek = pickle.load(f)
+    probe_model_path = _probe_peek.get("meta", {}).get("model")
+    del _probe_peek
+    if probe_model_path:
+        model_profile = detect_profile(probe_model_path)
+        print(f"[alloc] model profile: {model_profile.name} "
+              f"(derived from {probe_model_path})", flush=True)
+
     with open(args.probe, "rb") as f:
         probe = pickle.load(f)
     with open(args.costs, "rb") as f:
@@ -807,6 +849,7 @@ def main():
             args.bit_precision,
             no_fused_promote=args.no_fused_promote,
             overshoot_tolerance=args.overshoot_tolerance,
+            profile=model_profile,
         )
         if assignment is None:
             curve.append({"target_bits": t, "feasible": False})
@@ -868,6 +911,7 @@ def main():
         args.bit_precision,
         no_fused_promote=args.no_fused_promote,
         overshoot_tolerance=args.overshoot_tolerance,
+        profile=model_profile,
     )
     if assignment is None:
         raise SystemExit(

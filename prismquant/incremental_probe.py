@@ -234,6 +234,13 @@ def main():
     ap.add_argument("--include-lm-head", action="store_true", default=True,
                     help="Probe lm_head (`^lm_head$`).")
     ap.add_argument("--no-include-lm-head", action="store_false", dest="include_lm_head")
+    ap.add_argument("--h-detail-dir", default=None,
+                    help="If set, write per-Linear full Fisher diagonal "
+                         "(shape [out, in]) and per-packed-expert Fisher "
+                         "(shape [E, M]) as .pt files in this directory. "
+                         "measure_quant_cost reads them to compute the full "
+                         "per-weight Δloss = 0.5·<H, MSE_W> instead of the "
+                         "scalar proxy. Omit to keep the legacy scalar path.")
     args = ap.parse_args()
 
     # Body shard range may be partial; MTP / visual / lm_head are
@@ -309,6 +316,7 @@ def main():
             linear_exclude=r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|block_sparse_moe\.gate$)",
             importance_weighting=args.importance_weighting,
             activation_cache_dir=args.activation_cache_dir,
+            h_detail_dir=args.h_detail_dir,
             output_path=str(shard_path),
         )
         if exec_device.type == "cuda":

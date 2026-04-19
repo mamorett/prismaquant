@@ -57,18 +57,24 @@ def canonical_linear_name(name: str) -> str:
 
 def _accumulate_result(bucket: dict, name: str, fmt: str,
                        weight_mse: float, output_mse: float,
-                       rel_output_mse: float):
+                       rel_output_mse: float,
+                       predicted_dloss: float | None = None):
     per_name = bucket.setdefault(name, {})
     acc = per_name.setdefault(fmt, {
         "_count": 0,
         "_weight_mse_sum": 0.0,
         "_output_mse_sum": 0.0,
         "_rel_output_mse_sum": 0.0,
+        "_predicted_dloss_sum": 0.0,
+        "_predicted_dloss_count": 0,
     })
     acc["_count"] += 1
     acc["_weight_mse_sum"] += weight_mse
     acc["_output_mse_sum"] += output_mse
     acc["_rel_output_mse_sum"] += rel_output_mse
+    if predicted_dloss is not None:
+        acc["_predicted_dloss_sum"] += predicted_dloss
+        acc["_predicted_dloss_count"] += 1
 
 
 def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
@@ -80,12 +86,52 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
                 out[name][fmt] = acc
                 continue
             n = max(int(acc.pop("_count", 1)), 1)
-            out[name][fmt] = {
+            dloss_n = int(acc.pop("_predicted_dloss_count", 0) or 0)
+            dloss_sum = acc.pop("_predicted_dloss_sum", 0.0)
+            entry = {
                 "weight_mse": acc.pop("_weight_mse_sum") / n,
                 "output_mse": acc.pop("_output_mse_sum") / n,
                 "rel_output_mse": acc.pop("_rel_output_mse_sum") / n,
             }
+            if dloss_n > 0:
+                # Full per-weight Δloss from the H-detail path. The
+                # allocator prefers this scalar over the scalar-proxy
+                # fallback when it's present.
+                entry["predicted_dloss"] = dloss_sum / dloss_n
+            out[name][fmt] = entry
     return out
+
+
+class HDetailIndex:
+    """Disk-backed Fisher H-diagonal cache — the per-weight equivalent
+    of `ActivationIndex`.
+
+    Points at a directory where `sensitivity_probe.FisherAccumulator`
+    dumped per-Linear `[out, in]` tensors (and per-packed-expert
+    `[E, M]` tensors). `load(name)` returns the H diagonal tensor for
+    that Linear on demand."""
+
+    _FNAME_SUB = re.compile(r"[^A-Za-z0-9_-]")
+
+    def __init__(self, detail_dir: "Path", candidate_names):
+        self.detail_dir = detail_dir
+        self._paths: dict[str, Path] = {}
+        for name in candidate_names:
+            fname = self._FNAME_SUB.sub("__", name) + ".pt"
+            fp = detail_dir / fname
+            if fp.is_file():
+                self._paths[name] = fp
+
+    def __contains__(self, name: str) -> bool:
+        return name in self._paths
+
+    def __len__(self) -> int:
+        return len(self._paths)
+
+    def load(self, name: str) -> torch.Tensor:
+        blob = torch.load(self._paths[name], map_location="cpu",
+                          weights_only=False)
+        return blob["h_diag"]
 
 
 # ---------------------------------------------------------------------------
@@ -220,9 +266,14 @@ def _load_live_model(model_path: str, device: str, dtype: torch.dtype,
 
 def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
                      target_names: set[str], specs: list[fr.FormatSpec],
-                     device: str, dtype: torch.dtype) -> dict:
+                     device: str, dtype: torch.dtype,
+                     h_detail: "HDetailIndex | None" = None) -> dict:
     """One-Linear-at-a-time measurement. Simple, safe, slow on small ops
     running through unified memory but robust when batching isn't an option.
+
+    When `h_detail` is provided, also emits a full per-weight Δloss
+    `0.5 · <H_full, (W - W_hat)²>` per (Linear, format) — the allocator
+    prefers this scalar over the scalar-proxy fallback when present.
     """
     accum: dict[str, dict[str, dict]] = {}
     processed = 0
@@ -240,14 +291,24 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
         X = act_cache.load(canonical_name).to(W.dtype).to(W.device)
         y_ref = X @ W.T
         ref_energy = float(y_ref.float().pow(2).mean().item())
+        # Per-weight H diagonal if available. Shape matches W.
+        h_full = None
+        if h_detail is not None and canonical_name in h_detail:
+            h_full = h_detail.load(canonical_name).to(W.device).float()
+            if h_full.shape != W.shape:
+                h_full = None  # shape mismatch → fall back to scalar only
 
         for spec in specs:
             try:
                 W_hat = spec.quantize_dequantize(W.clone())
                 X_hat = spec.activation_quantize_dequantize(X.clone())
-                weight_mse = float((W - W_hat).pow(2).mean().item())
+                err = (W - W_hat).float()
+                weight_mse = float(err.pow(2).mean().item())
                 y_q = X_hat @ W_hat.T
                 output_mse = float((y_ref - y_q).float().pow(2).mean().item())
+                predicted_dloss = None
+                if h_full is not None:
+                    predicted_dloss = float(0.5 * (h_full * err.pow(2)).sum().item())
                 _accumulate_result(
                     accum,
                     canonical_name,
@@ -255,6 +316,7 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
                     weight_mse,
                     output_mse,
                     output_mse / max(ref_energy, 1e-12),
+                    predicted_dloss=predicted_dloss,
                 )
             except Exception as e:
                 accum.setdefault(canonical_name, {})[spec.name] = {"error": str(e)}
@@ -324,6 +386,7 @@ def _measure_packed_experts(
     device: str,
     dtype: torch.dtype,
     accum: dict,
+    h_detail: "HDetailIndex | None" = None,
 ) -> None:
     """Measure per-format weight_mse for each packed-expert tensor.
 
@@ -336,6 +399,13 @@ def _measure_packed_experts(
     weight_mse, so this is a deliberate skip rather than a missing
     measurement; a zero is recorded for output_mse so downstream code
     that still inspects the field gets a valid scalar.
+
+    When `h_detail` is provided, we also emit a per-weight Δloss based
+    on the packed H diagonal stored with per-expert per-output-channel
+    resolution (`[E, M]`). That resolution is coarser than the Linear
+    path's `[out, in]` — full `[E, M, N]` for 35B packed experts would
+    need 160+ GB — but it still captures the expert × channel structure
+    that the scalar trace loses.
     """
     dev = torch.device(device)
     entries = _enumerate_packed_experts(model, target_names)
@@ -343,16 +413,39 @@ def _measure_packed_experts(
         return
     for full_name, packed_param in entries:
         w = packed_param.detach().to(device=dev, dtype=dtype)
+        # Per-(expert, out-channel) H, shape [E, M]. Expanded to [E, M, 1]
+        # so broadcasting against (w-w_hat)² averaged over the in-features
+        # dim gives a single Δloss scalar per (layer, format).
+        h_em = None
+        if h_detail is not None and full_name in h_detail:
+            h = h_detail.load(full_name).to(dev).float()
+            if h.shape == (w.size(0), w.size(1)):
+                h_em = h
         for spec in specs:
             try:
                 w_hat = _batched_quantize(spec, w)
-                weight_mse = float((w - w_hat).float().pow(2).mean().item())
+                err = (w - w_hat).float()
+                weight_mse = float(err.pow(2).mean().item())
+                dloss_val = None
+                if h_em is not None:
+                    # err² shape [E, M, N]; mean over N turns into [E, M]
+                    # so per-channel H values weight the corresponding
+                    # per-channel average MSE. Multiply by N to recover
+                    # a sum-over-weights interpretation.
+                    per_ch_mse = err.pow(2).mean(dim=-1)   # [E, M]
+                    dloss_val = float(
+                        0.5 * (h_em * per_ch_mse).sum().item() * err.size(-1)
+                    )
+                    del per_ch_mse
                 _accumulate_result(accum, full_name, spec.name,
-                                   weight_mse, 0.0, 0.0)
-                del w_hat
+                                   weight_mse, 0.0, 0.0,
+                                   predicted_dloss=dloss_val)
+                del w_hat, err
             except Exception as e:
                 accum.setdefault(full_name, {})[spec.name] = {"error": str(e)}
         del w
+        if h_em is not None:
+            del h_em
         if dev.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -459,7 +552,8 @@ def _batched_quantize(spec: fr.FormatSpec, stacked_w: torch.Tensor) -> torch.Ten
 def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                        target_names: set[str], specs: list[fr.FormatSpec],
                        device: str, dtype: torch.dtype,
-                       chunk_size: int = 256) -> dict:
+                       chunk_size: int = 256,
+                       h_detail: "HDetailIndex | None" = None) -> dict:
     """Batched GPU measurement.
 
     Groups Linears by shape, then within each group processes `chunk_size`
@@ -471,6 +565,10 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
     (shape 2048×512) at BF16, one chunk of 256 = 256 MB weights; 256×256
     rows × 2048 = 128 MB activations; 3 formats × (W, Ŵ, Y_ref, Y_q) peak
     ~2 GB. Safe at chunk_size=256 on any GPU with 4+ GB free.
+
+    When `h_detail` is provided, also emits a full per-weight Δloss
+    `0.5 · <H_full, (W - W_hat)²>` per (Linear, format) alongside the
+    scalar output_mse.
     """
     dev = torch.device(device)
     groups = _group_by_shape(model, target_names)
@@ -507,16 +605,43 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
             y_ref = torch.bmm(X, W.transpose(1, 2))
             ref_energy = y_ref.float().pow(2).mean(dim=(1, 2))   # (N,)
 
+            # Per-item H full tensor stacked across the chunk, for the
+            # per-weight Δloss computation. Missing items get None.
+            h_stacked = None
+            h_avail = [False] * N
+            if h_detail is not None:
+                h_items = []
+                all_have = True
+                for nm in names:
+                    if nm in h_detail:
+                        h = h_detail.load(nm)
+                        if h.shape == (W.size(1), W.size(2)):
+                            h_items.append(h.to(dev).float())
+                            continue
+                    all_have = False
+                    break
+                if all_have and h_items:
+                    h_stacked = torch.stack(h_items, dim=0)   # (N, out, in)
+                    h_avail = [True] * N
+                    del h_items
+
             for spec in specs:
                 try:
                     W_hat = _batched_quantize(spec, W)
                     X_hat = spec.activation_quantize_dequantize(X.clone())
-                    weight_mse = (W - W_hat).float().pow(2).mean(dim=(1, 2))  # (N,)
+                    err = (W - W_hat).float()
+                    weight_mse = err.pow(2).mean(dim=(1, 2))  # (N,)
                     y_q = torch.bmm(X_hat, W_hat.transpose(1, 2))
                     output_mse = (y_ref - y_q).float().pow(2).mean(dim=(1, 2))  # (N,)
                     rel_mse = output_mse / ref_energy.clamp_min(1e-12)
+                    # Per-item predicted Δloss from full per-weight
+                    # Fisher. shape (N,).
+                    dloss_per = None
+                    if h_stacked is not None:
+                        dloss_per = 0.5 * (h_stacked * err.pow(2)).sum(dim=(1, 2))
                     # Unpack per-item into results dict
                     for i, name in enumerate(names):
+                        dloss_val = float(dloss_per[i].item()) if dloss_per is not None else None
                         _accumulate_result(
                             accum,
                             name,
@@ -524,8 +649,11 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                             float(weight_mse[i].item()),
                             float(output_mse[i].item()),
                             float(rel_mse[i].item()),
+                            predicted_dloss=dloss_val,
                         )
-                    del W_hat, X_hat, y_q, weight_mse, output_mse, rel_mse
+                    del W_hat, X_hat, err, y_q, weight_mse, output_mse, rel_mse
+                    if dloss_per is not None:
+                        del dloss_per
                     if dev.type == "cuda":
                         torch.cuda.empty_cache()
                 except Exception as e:
@@ -599,25 +727,41 @@ def run_cost_pass(model: nn.Module,
                   dtype: torch.dtype,
                   mode: str,
                   chunk_size: int,
-                  output_path: str):
+                  output_path: str,
+                  h_detail_dir: str | None = None):
     chosen_mode = mode
     if chosen_mode == "auto":
         chosen_mode = "batched" if device.startswith("cuda") else "unbatched"
     print(f"[cost] mode: {chosen_mode}")
 
+    h_detail: "HDetailIndex | None" = None
+    if h_detail_dir:
+        detail_path = Path(h_detail_dir)
+        if detail_path.exists():
+            h_detail = HDetailIndex(detail_path, target_names)
+            print(f"[cost] h-detail cache: {len(h_detail)} / {len(target_names)} "
+                  "Linears have full Fisher diagonal → using per-weight "
+                  "Δloss cost model", flush=True)
+        else:
+            print(f"[cost] WARN: h-detail dir {detail_path} not found; "
+                  "falling back to scalar proxy", flush=True)
+
     if chosen_mode == "batched":
         results = measure_batched_gpu(model, act_cache, target_names, specs,
                                       device, dtype,
-                                      chunk_size=chunk_size)
+                                      chunk_size=chunk_size,
+                                      h_detail=h_detail)
     else:
         results = measure_unbatched(model, act_cache, target_names, specs,
-                                    device, dtype)
+                                    device, dtype,
+                                    h_detail=h_detail)
 
     # Packed-expert tensors aren't visible to the nn.Linear-based path.
     # Measure them separately. Both paths share the same accumulator
     # format so finalization is uniform.
     packed_accum: dict[str, dict] = {}
-    _measure_packed_experts(model, target_names, specs, device, dtype, packed_accum)
+    _measure_packed_experts(model, target_names, specs, device, dtype,
+                            packed_accum, h_detail=h_detail)
     if packed_accum:
         results.update(_finalize_results(packed_accum))
         n_packed = len(packed_accum)

@@ -46,27 +46,14 @@ class Qwen3_5Profile(ModelProfile):
     def name(self) -> str:
         return "qwen3_5"
 
-    # ------------------------------------------------------------
-    # Fused-sibling promotion
-    # ------------------------------------------------------------
-    _FUSED_PATTERNS = (
-        # Standard attention q/k/v/o
-        (re.compile(r"^(.+?\.self_attn)\.(q|k|v|o)_proj$"),   r"\1.qkvo"),
-        # MLP gate/up siblings
-        (re.compile(r"^(.+?\.mlp)\.(gate|up)_proj$"),          r"\1.gate_up"),
-        (re.compile(r"^(.+?\.shared_expert)\.(gate|up)_proj$"), r"\1.gate_up"),
-        # Qwen3.6 GatedDeltaNet: in_proj_qkv + in_proj_z share one bmm in vLLM
-        (re.compile(r"^(.+?\.linear_attn)\.in_proj_(qkv|z)$"),  r"\1.qkvz"),
-        # Qwen3.6 GatedDeltaNet: in_proj_a + in_proj_b
-        (re.compile(r"^(.+?\.linear_attn)\.in_proj_(a|b)$"),    r"\1.ab"),
-    )
-
-    def fused_sibling_group(self, linear_qname: str) -> str | None:
-        for pat, repl in self._FUSED_PATTERNS:
-            m = pat.match(linear_qname)
-            if m:
-                return pat.sub(repl, linear_qname)
-        return None
+    def vllm_architecture_class(self) -> str | None:
+        """vLLM class to read `packed_modules_mapping` +
+        `hf_to_vllm_mapper` from. The base class auto-derives
+        `fused_sibling_group()` and the body-part of
+        `to_vllm_internal_name()` from these two attributes. We only
+        override `to_vllm_internal_name()` below to handle the MTP
+        prefix specially."""
+        return "Qwen3_5MoeForConditionalGeneration"
 
     # ------------------------------------------------------------
     # MoE
@@ -160,27 +147,41 @@ class Qwen3_5Profile(ModelProfile):
     # Naming remap for compressed-tensors scheme dispatch
     # ------------------------------------------------------------
     def to_vllm_internal_name(self, name: str) -> str:
-        # Body — multimodal source form.
-        if name.startswith("model.language_model."):
-            return "language_model.model." + name[len("model.language_model."):]
-        # Visual encoder — vLLM maps `model.visual.` -> `visual.`.
-        if name.startswith("model.visual."):
-            return "visual." + name[len("model.visual."):]
-        # MTP — preserve the `mtp.` prefix at scheme dispatch. vLLM's
-        # `mtp.→model.` rewrite is a weight-loader transform that runs
-        # AFTER scheme dispatch, so it does NOT affect target matching.
+        """Apply vLLM's HF→vLLM name remap (`hf_to_vllm_mapper`) for
+        body/visual/lm_head, with two arch-specific overrides:
+
+        1. MTP: preserve the `mtp.` prefix. vLLM's `mtp.→model.`
+           rewrite is a weight-loader transform that runs AFTER
+           scheme dispatch, so it does NOT affect target matching
+           — we need the literal `mtp.*` prefix in config_groups.
+
+        2. Text-only recipe form: PrismQuant's allocator emits body
+           entries as `model.layers.X.*` (from the staged text-only
+           probe), but vLLM's mapper only has a `model.language_model.`
+           -> `language_model.model.` prefix. We rewrite the
+           text-only form to the multimodal source form first so the
+           base-class mapper handles it uniformly.
+        """
+        # MTP — preserve prefix. See docstring.
         if name.startswith("mtp."):
             return name
-        # Body — text-only recipe form.
+        # Bare `lm_head` (no trailing dot) — vLLM's prefix mapper has
+        # `lm_head. -> language_model.lm_head.` which only matches when
+        # a `.suffix` follows. At scheme-dispatch the module qname is
+        # just `lm_head`, so we map explicitly.
+        if name == "lm_head":
+            return "language_model.lm_head"
+        # Lift text-only recipe form to multimodal source form so the
+        # vLLM-derived prefix mapper (from `hf_to_vllm_mapper`)
+        # catches it. The vLLM mapper's prefixes are
+        # `{model.visual. -> visual., lm_head. -> language_model.lm_head.,
+        #   model.language_model. -> language_model.model.}`
         if (name.startswith("model.layers.")
                 or name.startswith("model.embed_tokens")
                 or name.startswith("model.norm")
                 or name == "model"):
-            return "language_model.model." + name[len("model."):]
-        # lm_head — qwen3_5 multimodal class maps under language_model.
-        if name == "lm_head" or name.startswith("lm_head."):
-            return "language_model." + name
-        return name
+            name = "model.language_model." + name[len("model."):]
+        return super().to_vllm_internal_name(name)
 
     # ------------------------------------------------------------
     # Source passthrough + staging

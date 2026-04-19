@@ -120,14 +120,21 @@ def stage_text_only(model_path: str) -> str:
 
 
 class _GradNormCapture(torch.autograd.Function):
-    """Identity in forward; in backward, accumulates the squared Frobenius
-    norm of the incoming gradient into a per-name scalar in `accumulator`,
-    then returns None for the weight gradient — which tells autograd to
-    NOT accumulate to the leaf parameter's .grad.
+    """Identity in forward; in backward, accumulates per-expert
+    per-output-channel squared-gradient into `channel_accumulator` and
+    the scalar Frobenius-norm sum into `scalar_accumulator`, then
+    returns None for the weight gradient — which tells autograd to NOT
+    accumulate to the leaf parameter's .grad.
 
-    Used to capture the per-token empirical Fisher diagonal trace of a
-    packed expert tensor (e.g. Qwen3.6's `gate_up_proj` of shape
-    `[E, 2*I, H]`) without ever storing a full-size .grad on the leaf.
+    Used to capture the per-token empirical Fisher diagonal trace and
+    per-channel diagonal of a packed expert tensor (e.g. Qwen3.6's
+    `gate_up_proj` of shape `[E, 2*I, H]`) without ever storing a
+    full-size .grad on the leaf.
+
+    Storage: scalar is a float. Channel-diag is a [E, M] tensor — 256
+    experts × 1024 out rows × 4 B ≈ 1 MB per packed param, well below
+    the 2 GB full-resolution per-weight alternative that would be
+    infeasible at 35B scale.
 
     Why return None? With 40 MoE layers × 2 packed params × ~5 GB of
     bf16 grads = 400 GB if .grad were retained per leaf. By returning
@@ -135,32 +142,44 @@ class _GradNormCapture(torch.autograd.Function):
     .grad stays None on the leaf and only the transient grad_output
     (one per backward node, freed in topological order) is alive at
     any one time.
-
-    The norm is summed in chunks to keep the squared-tensor intermediate
-    small; the parameter itself can be 5+ GB on a 35B model.
     """
 
     @staticmethod
-    def forward(ctx, weight, name, accumulator):
+    def forward(ctx, weight, name, scalar_accumulator, channel_accumulator):
         ctx.name = name
-        ctx.accumulator = accumulator
+        ctx.scalar_acc = scalar_accumulator
+        ctx.channel_acc = channel_accumulator
         return weight
 
     @staticmethod
     def backward(ctx, grad_output):
         if grad_output is None:
-            return None, None, None
-        flat = grad_output.detach().reshape(-1)
-        # Streaming sum keeps the squared intermediate well under the
-        # full-tensor size. 1e6 elements × 4 B = 4 MB per chunk.
+            return None, None, None, None
+        g = grad_output.detach()
+        # Scalar Frobenius-norm squared — streamed to avoid materializing
+        # the full squared tensor for very large packed params.
+        flat = g.reshape(-1)
         chunk = 1_000_000
         total = 0.0
         for i in range(0, flat.numel(), chunk):
             total += float(flat[i:i + chunk].float().pow(2).sum().item())
-        ctx.accumulator[ctx.name] = ctx.accumulator.get(ctx.name, 0.0) + total
-        # Return None so no .grad allocation accumulates on the leaf
-        # parameter. PyTorch handles None as "no gradient contribution".
-        return None, None, None
+        ctx.scalar_acc[ctx.name] = ctx.scalar_acc.get(ctx.name, 0.0) + total
+        # Per-expert per-output-channel diagonal: reduce along the
+        # in-feature axis (the last dim). For a [E, M, N] packed param,
+        # result is [E, M]. Accumulated across backward samples.
+        if g.dim() == 3:
+            per_ch = g.float().pow(2).sum(dim=-1)      # [E, M]
+        elif g.dim() == 2:
+            per_ch = g.float().pow(2).sum(dim=-1, keepdim=False)  # [out]
+        else:
+            per_ch = None
+        if per_ch is not None:
+            cur = ctx.channel_acc.get(ctx.name)
+            if cur is None:
+                ctx.channel_acc[ctx.name] = per_ch.cpu()
+            else:
+                cur.add_(per_ch.cpu())
+        return None, None, None, None
 
 
 _PACKED_EXPERT_PARAM_NAMES = {
@@ -207,14 +226,24 @@ def _packed_experts_param_names(module: nn.Module) -> list[str]:
 
 
 _PRISMQUANT_PATCH_SENTINEL = "_prismquant_packed_expert_patch"
+_PRISMQUANT_CHANNEL_SENTINEL = "_prismquant_packed_expert_channel_patch"
 
 
 def install_packed_expert_hooks(
     model: nn.Module,
     accumulator: dict,
+    channel_accumulator: dict | None = None,
 ) -> dict[str, dict]:
     """Patch every packed-experts module's forward so its 3D parameters
     route through `_GradNormCapture` before each use.
+
+    `accumulator` collects the scalar Frobenius-norm squared (matches
+    the nn.Linear `h_trace_raw`). `channel_accumulator` collects the
+    per-expert per-output-channel diagonal as [E, M] CPU tensors (for
+    the full per-weight Fisher cost model). The channel accumulator is
+    optional for backward compatibility; when None, packed experts
+    contribute only their scalar trace and the allocator falls back to
+    the scalar proxy for those entries.
 
     Returns a metadata dict keyed by `<module_qname>.<param_name>` with
     the same shape/role information stored for nn.Linear modules in
@@ -222,9 +251,9 @@ def install_packed_expert_hooks(
     dict so the allocator can treat them uniformly.
 
     Idempotent across calls. If a module has already been patched (by
-    a prior call within the same Python process), we re-bind the
-    grad-norm dict reference to the new `accumulator` rather than
-    wrapping the patch again. This is essential for the incremental
+    a prior call within the same Python process), we re-bind both the
+    scalar and channel accumulator references to the new dicts rather
+    than wrapping the patch again. This is essential for the incremental
     probe path, which constructs a fresh FisherAccumulator per shard
     against a single loaded model.
 
@@ -250,6 +279,7 @@ def install_packed_expert_hooks(
         if hasattr(module, _PRISMQUANT_PATCH_SENTINEL):
             # Update the live accumulator binding for this module's patch.
             setattr(module, _PRISMQUANT_PATCH_SENTINEL, accumulator)
+            setattr(module, _PRISMQUANT_CHANNEL_SENTINEL, channel_accumulator)
             # Still report metadata so callers can refresh their stats dict.
             for pn in param_names:
                 p_existing = module._parameters.get(pn)
@@ -321,23 +351,31 @@ def install_packed_expert_hooks(
         full_names = [f"{qname}.{pn}" if qname else pn for pn in ns]
         mod_ref = module
 
-        # Store the live accumulator as an attribute so subsequent calls
-        # to install_packed_expert_hooks can re-bind it (per-shard) by
-        # just updating this attribute. patched_forward reads it
+        # Store the live accumulators as attributes so subsequent calls
+        # to install_packed_expert_hooks can re-bind them (per-shard) by
+        # just updating these attributes. patched_forward reads them
         # indirectly each invocation via getattr.
         setattr(mod_ref, _PRISMQUANT_PATCH_SENTINEL, accumulator)
+        setattr(mod_ref, _PRISMQUANT_CHANNEL_SENTINEL, channel_accumulator)
 
         def patched_forward(*args, _ns=ns, _full=full_names, _orig=original_forward,
                             _mod=mod_ref, **kwargs):
             acc = getattr(_mod, _PRISMQUANT_PATCH_SENTINEL, None)
+            ch_acc = getattr(_mod, _PRISMQUANT_CHANNEL_SENTINEL, None)
             if acc is None:
                 # Should not happen, but degrade gracefully.
                 return _orig(*args, **kwargs)
+            if ch_acc is None:
+                # Provide a scratch dict we can throw away if the caller
+                # didn't opt in to per-channel accumulation, so the
+                # autograd Function signature stays uniform.
+                ch_acc = {}
             saved_params = {}
             wrapped = {}
             for pn, fn in zip(_ns, _full):
                 saved_params[pn] = _mod._parameters.pop(pn)
-                wrapped[pn] = _GradNormCapture.apply(saved_params[pn], fn, acc)
+                wrapped[pn] = _GradNormCapture.apply(
+                    saved_params[pn], fn, acc, ch_acc)
                 _mod.__dict__[pn] = wrapped[pn]
             try:
                 return _orig(*args, **kwargs)
@@ -584,13 +622,15 @@ class FisherAccumulator:
                  expert_info: dict[str, tuple[str, str]],
                  act_cache_dir: Path | None = None,
                  input_rows: int = 256,
-                 hook_packed_experts: bool = True):
+                 hook_packed_experts: bool = True,
+                 h_detail_dir: Path | None = None):
         self.stats: dict[str, dict] = {}
         self._saved_inputs: dict[str, torch.Tensor] = {}
         self._fwd_handles, self._bwd_handles = [], []
         self.tracked = set(tracked)
         self.expert_info = expert_info
         self.cache_dir = act_cache_dir
+        self.h_detail_dir = Path(h_detail_dir) if h_detail_dir else None
         self.input_rows = input_rows
         self._input_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
         self._rows_got: dict[str, int] = defaultdict(int)
@@ -605,6 +645,18 @@ class FisherAccumulator:
         self._packed_act_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
         self._packed_act_rows: dict[str, int] = defaultdict(int)
 
+        # Per-layer accumulator for full per-weight Fisher diagonal.
+        # Keyed by Linear qname -> CPU fp64 tensor of shape [out, in]
+        # matching the weight shape. Accumulated by the backward hook;
+        # written to `probe_detail/<sanitized_name>.pt` in finalize()
+        # so the probe pickle stays small while downstream consumers
+        # can lazy-load the full H per layer.
+        self._h_full: dict[str, torch.Tensor] = {}
+        # Same idea for packed experts, but reduced to per-expert
+        # per-output-channel: [E, M] instead of [E, M, N]. Full
+        # per-weight for 80 packed tensors at 35B scale is 160+ GB;
+        # per-channel is 160 MB total — still a vector form.
+        self._h_packed_channel: dict[str, torch.Tensor] = {}
         for name, mod in model.named_modules():
             if name not in self.tracked or not isinstance(mod, nn.Linear):
                 continue
@@ -623,6 +675,11 @@ class FisherAccumulator:
                 "router_path": router_qname,
                 "expert_id": eid,
             }
+            # GPU fp32 accumulator: transferred to CPU fp64 at finalize.
+            self._h_full[name] = torch.zeros(
+                mod.out_features, mod.in_features,
+                dtype=torch.float32, device=w.device,
+            )
             self._fwd_handles.append(
                 mod.register_forward_hook(self._make_fwd(name)))
             self._bwd_handles.append(
@@ -632,6 +689,7 @@ class FisherAccumulator:
             packed_meta = install_packed_expert_hooks(
                 model,
                 accumulator=self._packed_grad_acc,
+                channel_accumulator=self._h_packed_channel,
             )
             for full_name, meta in packed_meta.items():
                 # Filter against the tracked set when tracked is a regex
@@ -700,10 +758,17 @@ class FisherAccumulator:
             gy2 = gy.reshape(-1, gy.size(-1))
             x2 = x.reshape(-1, x.size(-1))
             grad_w = gy2.t() @ x2
-            self.stats[name]["h_trace_raw"] += float(grad_w.pow(2).sum().item())
+            grad_w_sq = grad_w.pow(2)
+            # Full per-weight Fisher accumulation: required for the
+            # `predicted_dloss = 0.5 · <H_full, MSE_W_full>` cost model
+            # that replaces the scalar `h_trace · mse_scalar` proxy.
+            acc = self._h_full.get(name)
+            if acc is not None:
+                acc.add_(grad_w_sq.float())
+            self.stats[name]["h_trace_raw"] += float(grad_w_sq.sum().item())
             w = mod_ref.weight.detach()
             self.stats[name]["h_w2_sum_raw"] += float(
-                (grad_w.pow(2) * w.pow(2)).sum().item())
+                (grad_w_sq * w.pow(2)).sum().item())
             self.stats[name]["n_tokens_seen"] += x2.size(0)
         return hook
 
@@ -752,6 +817,43 @@ class FisherAccumulator:
                 fname = re.sub(r"[^A-Za-z0-9_-]", "__", experts_qname) + ".pt"
                 torch.save({"inputs": X, "name": experts_qname},
                            self.cache_dir / fname)
+
+        # Write per-layer Fisher H detail files (the full per-weight
+        # diagonal for Linears, per-expert per-output-channel for packed
+        # experts). The probe pickle stores scalar summaries + the
+        # detail-file path; measure_quant_cost loads them lazily so the
+        # full allocator cost model can run without bloating probe.pkl.
+        if self.h_detail_dir is not None:
+            self.h_detail_dir.mkdir(parents=True, exist_ok=True)
+            sub = re.compile(r"[^A-Za-z0-9_-]")
+            for name, acc in self._h_full.items():
+                if name not in self.stats:
+                    continue
+                tokens = max(self.stats[name]["n_tokens_seen"], 1)
+                rp = self.stats[name].get("route_prob")
+                # Apply the same normalization as the scalar trace.
+                if rp is not None and rp > 0:
+                    h = acc.to(torch.float32).cpu() / (tokens * rp)
+                else:
+                    h = acc.to(torch.float32).cpu() / tokens
+                fname = sub.sub("__", name) + ".pt"
+                torch.save({"h_diag": h, "name": name, "kind": "linear",
+                            "shape": list(h.shape)},
+                           self.h_detail_dir / fname)
+                self.stats[name]["h_detail_path"] = fname
+            for full_name, ch in self._h_packed_channel.items():
+                if full_name not in self.stats:
+                    continue
+                tokens = max(self.stats[full_name]["n_tokens_seen"], 1)
+                # Packed experts don't carry a router_path — routing is
+                # baked into the Fisher signal via how often each expert
+                # was selected. Normalize by token count only.
+                h = ch.to(torch.float32) / tokens
+                fname = sub.sub("__", full_name) + ".pt"
+                torch.save({"h_diag": h, "name": full_name, "kind": "packed",
+                            "shape": list(h.shape)},
+                           self.h_detail_dir / fname)
+                self.stats[full_name]["h_detail_path"] = fname
 
     def remove_hooks(self):
         for h in self._fwd_handles + self._bwd_handles:
@@ -953,7 +1055,8 @@ def run_probe_pass(model: nn.Module,
                    linear_exclude: str,
                    importance_weighting: bool,
                    activation_cache_dir: str | None,
-                   output_path: str):
+                   output_path: str,
+                   h_detail_dir: str | None = None):
     inc = re.compile(linear_include)
     exc = re.compile(linear_exclude)
     tracked = [n for n, m in model.named_modules()
@@ -990,7 +1093,9 @@ def run_probe_pass(model: nn.Module,
 
     tracker = RouterTracker(model, routers, top_k) if routers else None
     cache_dir = Path(activation_cache_dir) if activation_cache_dir else None
-    acc = FisherAccumulator(model, tracked, expert_info, cache_dir)
+    detail_dir = Path(h_detail_dir) if h_detail_dir else None
+    acc = FisherAccumulator(model, tracked, expert_info, cache_dir,
+                            h_detail_dir=detail_dir)
 
     print(f"[probe] calibration shape: {calib.shape}", flush=True)
 

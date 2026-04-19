@@ -31,7 +31,23 @@ import torch.nn as nn
 
 
 class ModelProfile(ABC):
-    """Base class for all PrismQuant architecture profiles."""
+    """Base class for all PrismQuant architecture profiles.
+
+    Where possible, default implementations auto-derive their return
+    values from the vLLM model class registered for this architecture
+    (`vllm_architecture_class()`). That way, adding a new architecture
+    typically only requires `matches()`, `vllm_architecture_class()`,
+    and an optional `build_mtp_module()` — the rest comes from vLLM's
+    `packed_modules_mapping` and `hf_to_vllm_mapper` class attributes.
+    """
+
+    def __init__(self) -> None:
+        # Lazy-compiled derivations from the vLLM class. Computed on
+        # first access so profile construction stays cheap.
+        self._vllm_cls = None
+        self._vllm_cls_loaded = False
+        self._fused_matcher = None
+        self._name_remapper = None
 
     # ------------------------------------------------------------
     # Identity + match
@@ -47,6 +63,24 @@ class ModelProfile(ABC):
     def name(self) -> str:
         """Profile identifier (e.g. 'qwen3_5', 'default')."""
 
+    def vllm_architecture_class(self) -> str | None:
+        """Return the HF `architectures[0]` string whose vLLM class
+        PrismQuant should read `packed_modules_mapping` and
+        `hf_to_vllm_mapper` from. Profiles that don't have a vLLM
+        counterpart (dev-only architectures) can return None and
+        override the dependent methods manually."""
+        return None
+
+    def _ensure_vllm_class(self):
+        if self._vllm_cls_loaded:
+            return
+        self._vllm_cls_loaded = True
+        arch = self.vllm_architecture_class()
+        if arch is None:
+            return
+        from .vllm_registry import vllm_class_for_architecture
+        self._vllm_cls = vllm_class_for_architecture(arch)
+
     # ------------------------------------------------------------
     # Fused-sibling promotion (allocator.py)
     # ------------------------------------------------------------
@@ -54,12 +88,28 @@ class ModelProfile(ABC):
         """Return a canonical 'group key' if this Linear belongs to a
         fused-sibling group (q/k/v/o, gate/up, etc.), otherwise None.
 
-        Example (Qwen3.5):
-          model.layers.3.self_attn.q_proj -> 'model.layers.3.self_attn.qkv'
-          model.layers.3.self_attn.k_proj -> 'model.layers.3.self_attn.qkv'
-          model.layers.3.mlp.gate_proj    -> 'model.layers.3.mlp.gate_up'
+        Default implementation derives sibling groups from the vLLM
+        class's `packed_modules_mapping` attribute. Profiles can
+        override to add arch-specific groups vLLM doesn't know about,
+        or to bypass the vLLM lookup entirely.
+
+        Example (Qwen3.5 via vLLM's `Qwen3_5MoeForConditionalGeneration`):
+          model.layers.3.self_attn.q_proj -> 'model.layers.3.self_attn.qkv_proj'
+          model.layers.3.self_attn.k_proj -> 'model.layers.3.self_attn.qkv_proj'
+          model.layers.3.mlp.gate_proj    -> 'model.layers.3.mlp.gate_up_proj'
         """
-        return None
+        if self._fused_matcher is None:
+            self._ensure_vllm_class()
+            from .vllm_registry import (
+                fused_sibling_matcher_from_packed_mapping,
+                packed_modules_mapping_from_class,
+            )
+            pm = packed_modules_mapping_from_class(self._vllm_cls)
+            if not pm:
+                self._fused_matcher = lambda _qname: None
+            else:
+                self._fused_matcher = fused_sibling_matcher_from_packed_mapping(pm)
+        return self._fused_matcher(linear_qname)
 
     # ------------------------------------------------------------
     # MoE packing
@@ -134,8 +184,26 @@ class ModelProfile(ABC):
         to the vLLM-internal module qname that `find_matched_target`
         compares against at scheme dispatch.
 
-        Default: identity. Multimodal / MoE architectures override."""
-        return checkpoint_name
+        Default implementation uses the vLLM class's `hf_to_vllm_mapper`
+        (specifically its `orig_to_new_prefix` dict). Matches vLLM's
+        own weight-loader remap, so the allocator's config_groups
+        targets and the runtime scheme-dispatch names stay in sync
+        without PrismQuant duplicating the mapping.
+
+        Profiles override when: (a) there's no vLLM class for this
+        arch, (b) the vLLM mapper is regex/substring-based (we only
+        consume the prefix form), or (c) there are arch-specific
+        quirks like MTP that need special handling beyond the simple
+        prefix rewrite."""
+        if self._name_remapper is None:
+            self._ensure_vllm_class()
+            from .vllm_registry import (
+                hf_to_vllm_prefix_map_from_class,
+                name_remapper_from_prefix_map,
+            )
+            prefix = hf_to_vllm_prefix_map_from_class(self._vllm_cls)
+            self._name_remapper = name_remapper_from_prefix_map(prefix)
+        return self._name_remapper(checkpoint_name)
 
     def source_tensor_name(self, model_qname: str) -> str:
         """Rewrite an in-memory HF module qname (from `named_parameters`)

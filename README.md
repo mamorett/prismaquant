@@ -704,21 +704,178 @@ Fits 128 GB unified systems (DGX Spark GB10, etc.) for models up to
 scripts aborts cleanly on swap pressure rather than OOM-killing the
 host.
 
+## Adding a new architecture
+
+PrismQuant's pipeline is **model-agnostic by default**, with
+architecture-specific knowledge concentrated in a `ModelProfile`
+subclass. Most of what a profile needs is already encoded by vLLM on
+its model class and **auto-derived** — a new architecture's profile
+typically just names the vLLM class and optionally supplies an
+MTP-probe helper.
+
+### The concentration principle
+
+Every place PrismQuant needs to make an architecture-specific
+decision — fused-sibling promotion, vLLM's weight-loader naming
+convention, packed-expert parameter names, MTP module construction,
+source passthrough prefixes — is routed through `ModelProfile`.
+Profiles are looked up once at runtime from the HF config's
+`model_type` and `architectures` fields; no other file in the
+pipeline cares which architecture it's looking at.
+
+### What the profile gets for free
+
+Default implementations in `ModelProfile` read two attributes off
+the vLLM model class registered for this architecture:
+
+- **`packed_modules_mapping`** (e.g.
+  `{'qkv_proj': ['q_proj', 'k_proj', 'v_proj'], 'gate_up_proj': ['gate_proj', 'up_proj'], ...}`).
+  Drives `profile.fused_sibling_group()` — the allocator promotes all
+  members of a fused group to the highest-precision sibling so vLLM's
+  fused-loader sees consistent formats.
+- **`hf_to_vllm_mapper.orig_to_new_prefix`** (e.g.
+  `{'model.language_model.': 'language_model.model.', 'model.visual.': 'visual.', 'lm_head.': 'language_model.lm_head.'}`).
+  Drives `profile.to_vllm_internal_name()` — the config_groups targets
+  and vLLM's scheme-dispatch names stay in sync without PrismQuant
+  duplicating the mapping.
+
+Both are **vLLM's source of truth**. When vLLM adds a new fused
+pattern or naming quirk on an existing architecture, PrismQuant picks
+it up on the next probe run with no PrismQuant-side code change.
+
+### What the profile still writes by hand
+
+- **`matches(model_type, architectures)`** — pattern-match on HF config.
+- **`name`** — profile identifier string.
+- **`vllm_architecture_class()`** — one string: the HF
+  `architectures[0]` entry whose vLLM class carries the metadata above.
+- **`build_mtp_module(text_config)`** (only if the arch has MTP) — an
+  HF-module replica of vLLM's MTP forward so PrismQuant's Fisher probe
+  can backward through it. vLLM's MTP class isn't HF-autograd-friendly,
+  which is why this one piece can't auto-derive.
+- **`source_passthrough_prefixes()`** (optional) — which top-level
+  prefixes get copied from source as BF16 (visual encoder if we defer
+  calibration, MTP residue, etc.).
+- **`to_vllm_internal_name()` override** (optional) — for arch quirks
+  that the vLLM prefix map doesn't capture. Qwen3.5/3.6 overrides to
+  preserve the `mtp.` prefix at scheme-dispatch (vLLM's `mtp.→model.`
+  remap runs at weight-load, not scheme-dispatch).
+
+### The onboarding flow (concrete steps)
+
+For a hypothetical `WhateverForCausalLM`:
+
+1. **Write the profile:**
+
+```python
+# prismquant/model_profiles/whatever.py
+from .base import ModelProfile
+
+class WhateverProfile(ModelProfile):
+    @classmethod
+    def matches(cls, model_type, architectures):
+        return model_type == "whatever" or any(
+            a.startswith("Whatever") for a in architectures)
+
+    @property
+    def name(self): return "whatever"
+
+    def vllm_architecture_class(self):
+        return "WhateverForCausalLM"
+
+    # ... only if has_mtp / visual / quirks:
+    # def has_mtp(self): return True
+    # def build_mtp_module(self, text_config): ...
+```
+
+2. **Register it:**
+
+```python
+from prismquant.model_profiles import register_profile
+register_profile(WhateverProfile)
+```
+
+Or add to `prismquant/model_profiles/registry.py`'s `_REGISTERED` list.
+
+3. **Validate it against a real checkpoint** — this is the load-bearing
+step. The validator catches 90% of "I forgot to update this" bugs:
+
+```
+python -m prismquant.model_profiles.validate \
+    --model /path/to/Whatever-7B
+```
+
+Output is a list of ✓/✗ checks:
+
+```
+Validating profile: WhateverProfile (auto-detected)
+Model:              /path/to/Whatever-7B
+vllm class:         WhateverForCausalLM
+
+  ✓ matches() returns True for this model
+  ✓ vllm_architecture_class() resolves
+  ✓ fused-sibling groups consistent
+      5 fused groups × multiple siblings map to the same canonical key
+  ✓ to_vllm_internal_name() obeys vLLM's prefix map
+      3 prefix rewrites agree
+  ✓ packed_expert_param_names() cover actual 3D params
+      2/2 declared names found
+  ✓ source_passthrough_prefixes() cover real tensors
+      2 prefixes, all match at least one tensor
+  ✓ MTP module constructs + loads weights
+
+7 / 7 checks passed
+```
+
+The validator cross-checks against vLLM's class metadata + the
+model's safetensors index + (if MTP) an actual MTP module
+instantiation. Passing checks don't guarantee the export will work
+end-to-end, but they catch every class of consistency bug I've
+found so far across three architecture families.
+
+4. **Run the pipeline.** No other file in PrismQuant knows which
+architecture you're on. The probe, cost, allocator, and export all
+pull from the profile when they need an arch-specific decision.
+
+5. **Report**. Add a line to the README's validated-models list, ship
+a recipe, and open a PR with the probe/cost artifacts and eval
+numbers so the next person can see precedent.
+
+### Coverage status
+
+- **`Qwen3_5Profile`** — covers Qwen3.5, Qwen3.6. Tested end-to-end on
+  Qwen3.6-35B-A3B. Validator passes 7/7.
+- **`DefaultProfile`** — generic fallback. No fused-sibling promotion,
+  no MTP, identity name remap. Will do the right thing for simple
+  architectures whose vLLM class has `packed_modules_mapping` but
+  won't handle MTP or multimodal naming quirks.
+
+Planned profiles (should all be ~50-line files each since the vLLM
+registry gives most of what we need):
+
+- `DeepseekV3Profile` — covers DeepSeek-V3 family; has MTP
+  (`deepseek_mtp`), has MoE (different packed convention than Qwen).
+- `GLM4MoEProfile` — has MTP (`glm4_moe_mtp`), has MoE.
+- `MinimaxProfile` — MiniMax M1/M2.7; novel architecture, may need
+  more than vLLM exposes.
+- `LlamaMoEProfile` — Llama 3 / 4 MoE variants (no MTP).
+
+Contributions welcome; the validator should give clear feedback on
+what's missing for any profile submission.
+
 ## What's deferred
 
-- **Visual encoder**: weights pass through as BF16 from source. The
-  probe ran the regex for visual blocks, but `stage_text_only` strips
-  `vision_config` from the staged config so the loaded model never
-  instantiates visual modules. Real multimodal calibration (load
-  `Qwen3_5MoeForConditionalGeneration` + use `AutoProcessor` on an
-  image dataset) is straightforward follow-up but not yet in the
-  pipeline.
-- **Non-qwen3.5/3.6 MTP support**: The `MtpModule` currently mirrors
-  qwen3_5's forward exactly. Other MTP-bearing architectures
-  (deepseek_mtp, glm4_moe_mtp, etc.) need their own forward construction.
-- **Fused-sibling promotion for arbitrary model families**: The fused
-  patterns are hand-listed in `allocator.py`. A model-profile registry
-  (see "Roadmap") will make this derivable from vLLM's model registry.
+- **Visual encoder calibration**: weights pass through as BF16 from
+  source. The probe ran the regex for visual blocks, but
+  `stage_text_only` strips `vision_config` from the staged config so
+  the loaded model never instantiates visual modules. Real multimodal
+  calibration (load `ForConditionalGeneration` + use `AutoProcessor`
+  on an image dataset) is straightforward follow-up but not yet in
+  the pipeline.
+- **Non-Qwen MTP forward construction**: The HF-side MTP module
+  replica used for Fisher probing is profile-provided. Qwen3.5/3.6
+  has one (`Qwen3_5Profile.build_mtp_module`). Other MTP architectures
+  need their own — see "Adding a new architecture" above.
 
 ## Roadmap
 

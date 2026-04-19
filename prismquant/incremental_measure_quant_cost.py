@@ -76,6 +76,12 @@ def main():
     ap.add_argument("--layers-per-shard", type=int, default=1)
     ap.add_argument("--start-layer", type=int, default=0)
     ap.add_argument("--end-layer", type=int, default=None)
+    ap.add_argument("--h-detail-dir", default=None,
+                    help="If set, read per-Linear Fisher H diagonal (from "
+                         "incremental_probe's --h-detail-dir) and emit "
+                         "per-(layer, format) predicted_dloss alongside "
+                         "weight_mse in cost.pkl. Enables full per-weight "
+                         "Δloss = 0.5·<H, MSE_W> cost model.")
     args = ap.parse_args()
 
     n_layers = load_num_hidden_layers(args.model)
@@ -160,6 +166,7 @@ def main():
             mode=args.mode,
             chunk_size=args.chunk_size,
             output_path=str(shard_path),
+            h_detail_dir=args.h_detail_dir,
         )
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
