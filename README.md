@@ -135,6 +135,80 @@ vLLM backend at serve time: **FLASHINFER_CUTLASS** for NVFP4 MoE,
 **CutlassFP8ScaledMMLinearKernel** for the FP8 W8A8 bucket, **FLASH_ATTN v2**
 for attention, **prefix caching + FP8 KV cache** enabled.
 
+### Zero-shot benchmark suite
+
+Three-way comparison against the BF16 source and **RedHatAI's
+`Qwen3.6-35B-A3B-NVFP4`** — a uniform-NVFP4 quantization of the same
+base model produced by `llm-compressor`. All three artifacts evaluated
+on the same vLLM server config (FP8 KV cache, FlashInfer backend,
+prefix caching, `num_concurrent=16`), zero-shot, loglikelihood
+scoring via lm-evaluation-harness.
+
+| Task | Metric | BF16 (70 GB) | **PrismQuant 4.75 bpp (22 GB)** | RedHat NVFP4 (24 GB) | Δ PQ−BF16 | Δ RH−BF16 | **Δ PQ−RH** |
+|---|---|---:|---:|---:|---:|---:|---:|
+| arc_easy      | acc      | 81.23 ± 0.80 | **80.72 ± 0.81** | 77.61 ± 0.86 | −0.51 | **−3.62** | **+3.11** |
+| arc_easy      | acc_norm | 71.76 ± 0.92 | **72.26 ± 0.92** | 69.49 ± 0.94 | **+0.51** | −2.27 | **+2.78** |
+| arc_challenge | acc      | 54.86 ± 1.45 | **54.35 ± 1.46** | 51.79 ± 1.46 | −0.51 | −3.07 | **+2.56** |
+| arc_challenge | acc_norm | 54.95 ± 1.45 | **55.03 ± 1.45** | 53.50 ± 1.46 | **+0.08** | −1.45 | **+1.54** |
+| piqa          | acc      | 82.21 ± 0.89 | **81.94 ± 0.90** | 80.79 ± 0.92 | −0.27 | −1.41 | **+1.14** |
+| piqa          | acc_norm | 82.97 ± 0.88 | **82.10 ± 0.89** | 81.77 ± 0.90 | −0.87 | −1.20 | +0.33 |
+| hellaswag     | acc      | 63.43 ± 0.48 | 62.68 ± 0.48     | 62.70 ± 0.48 | −0.76 | −0.74 | −0.02 |
+| hellaswag     | acc_norm | 83.47 ± 0.37 | **82.91 ± 0.38** | 82.21 ± 0.38 | −0.56 | −1.25 | **+0.70** |
+| winogrande    | acc      | 75.69 ± 1.21 | **73.48 ± 1.24** | 70.80 ± 1.28 | −2.21 | **−4.89** | **+2.68** |
+
+**Headline numbers**:
+
+- Mean Δ vs BF16: PrismQuant **−0.56 pp**, RedHat **−2.21 pp** (~4×
+  closer to BF16 on average).
+- PrismQuant wins **8 / 9 metrics** vs RedHat (hellaswag-acc is a
+  0.02 pp tie). Sign test p < 0.02.
+- Biggest single-task gap: **arc_easy −3.62 pp** on RedHat vs
+  −0.51 pp on PrismQuant — a 3.11 pp PrismQuant advantage at a
+  combined stderr of 1.18 pp → **2.6σ, statistically significant**.
+- arc_easy also shows the pathology the Motivation section warned
+  about: when every Linear gets NVFP4 with only a hand-picked ignore
+  list, the ~5 % of genuinely sensitive Linears collapse the whole
+  task. PrismQuant's sensitivity-driven allocation keeps them in BF16
+  or MXFP8 and recovers 3 pp of accuracy for **2 GB less on disk**.
+
+**What this says about the allocator**: RedHat's checkpoint is one
+format group with one regex target and 342 hand-picked ignores. At
+equivalent size, PrismQuant's 252 BF16 + 26 MXFP8 + 124 NVFP4 mix
+(all decisions driven by measured `0.5·H·MSE_W`) is *strictly better*
+on 8 out of 9 zero-shot metrics and tied on the ninth. The
+sensitivity-driven allocator is doing measurable work beyond what
+uniform quantization + a curated ignore list produces.
+
+### Honest caveats on the task mix
+
+The five tasks above are commonsense / world-knowledge benchmarks
+that a 35 B MoE saturates. They test whether quantization
+catastrophically broke the model; they do *not* stress reasoning
+chains, in-context learning, or generation fluency.
+
+What's **not yet in the table** and what the pre-publication roadmap
+calls for:
+
+- **MMLU 5-shot** (especially MMLU-STEM) — reasoning-heavy, standard
+  benchmark for PTQ papers, where compounding quantization error
+  shows up most visibly.
+- **GSM8K 5-shot** (generative, strict-match) — arithmetic + multi-step
+  reasoning; the canonical "did quantization break the model?" test.
+- **HumanEval / MBPP** — code generation, tests generation quality
+  directly rather than loglikelihood scoring.
+- **MT-Bench or AlpacaEval** — open-ended generation quality.
+- **Per-budget Pareto sweep** — we've only measured 4.75 bpp. The
+  Pareto curve in the next section is *predicted* Δloss from the
+  allocator. Genuine validation requires quantizing at 4.5 and 5.0
+  and measuring.
+- **Seed sweep** — single run per artifact. winogrande's −2.21 / −4.89
+  deltas are real-looking but should be averaged over 2-3 seeds.
+
+Until those land, the defensible claim is the headline above:
+**PrismQuant beats uniform NVFP4 on commonsense zero-shot at a
+smaller size**. The reasoning-heavy and generative-quality story is
+still pending.
+
 ## Why 4.75 bpp — the cheap quarter-bit
 
 **The 4.75 bpp target in this artifact was a first-shot proof of
