@@ -26,11 +26,13 @@ from pathlib import Path
 
 from .base import ModelProfile
 from .default import DefaultProfile
+from .gemma4 import Gemma4Profile
 from .qwen3_5 import Qwen3_5Profile
 
 
 _REGISTERED: list[type[ModelProfile]] = [
     Qwen3_5Profile,
+    Gemma4Profile,
 ]
 
 

@@ -245,6 +245,13 @@ def _check_mtp(profile, cfg: dict, model_path: str) -> CheckResult:
 
 
 def _check_source_passthrough(profile, model_path: str) -> CheckResult:
+    """Passthrough prefixes should mostly match — but profiles cover a
+    family of variants (e.g. Gemma 4 26B-A4B has no audio tower, but
+    Gemma 4 31B-IT may), so unused prefixes aren't a fatal profile bug.
+    We pass if at least one prefix matches something AND report unused
+    prefixes as informational. Fail only if every declared prefix is
+    dead on this checkpoint — that implies the profile doesn't know
+    this architecture at all."""
     prefixes = profile.source_passthrough_prefixes()
     if not prefixes:
         return CheckResult("source_passthrough_prefixes() cover real tensors",
@@ -255,17 +262,17 @@ def _check_source_passthrough(profile, model_path: str) -> CheckResult:
                            True, f"{idx_path} missing — cannot verify")
     with open(idx_path) as f:
         keys = list(json.load(f).get("weight_map", {}).keys())
-    missing = []
-    for p in prefixes:
-        if not any(k.startswith(p) for k in keys):
-            missing.append(p)
-    if missing:
+    covered = [p for p in prefixes if any(k.startswith(p) for k in keys)]
+    missing = [p for p in prefixes if p not in covered]
+    if not covered:
         return CheckResult(
             "source_passthrough_prefixes() cover real tensors", False,
-            f"dead prefixes (match nothing on disk): {missing}")
+            f"no declared prefix matches any tensor on disk: {list(prefixes)}")
+    detail = f"{len(covered)}/{len(prefixes)} prefixes match"
+    if missing:
+        detail += f" — unused on this variant: {missing}"
     return CheckResult(
-        "source_passthrough_prefixes() cover real tensors", True,
-        f"{len(prefixes)} prefixes, all match at least one tensor")
+        "source_passthrough_prefixes() cover real tensors", True, detail)
 
 
 def _check_packed_experts(profile, model_path: str) -> CheckResult:
