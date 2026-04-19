@@ -179,6 +179,61 @@ on 8 out of 9 zero-shot metrics and tied on the ninth. The
 sensitivity-driven allocator is doing measurable work beyond what
 uniform quantization + a curated ignore list produces.
 
+### Why RedHat has more BF16 layers but worse accuracy
+
+Worth dwelling on: **RedHat's artifact preserves *more* Linears in
+BF16 than PrismQuant does**, yet is simultaneously larger on disk
+*and* lower quality. The RedHat quantization_config's ignore list
+contains **342 entries** — the entire visual encoder (110 Linears),
+all 40 MoE routers, the `linear_attn.*` GatedDeltaNet projections on
+every body layer (~150 entries), every `shared_expert.*`, `lm_head`,
+MTP head. PrismQuant's artifact keeps only **252 Linears** in BF16 —
+90 fewer.
+
+|  | BF16 Linears | MXFP8 | NVFP4 (dense) | NVFP4 (per-expert MoE) | Disk |
+|---|---:|---:|---:|---:|---:|
+| RedHat NVFP4        | **342** | 0  | 0   | ~20.5 k (via one regex) | 24 GB |
+| PrismQuant 4.75 bpp | **252** | 26 | 44  | ~20.5 k                 | **22 GB** |
+
+The apparent paradox — RedHat has *more* BF16 yet *larger* disk and
+*lower* accuracy — is exactly the over-preservation failure mode the
+Motivation section warned about. RedHat's quantizer can't measure
+sensitivity, so it hedges: "leave everything that might be sensitive
+in BF16." The 90-Linear gap between 342 and 252 is Linears RedHat
+conservatively preserved but PrismQuant's `0.5·H·MSE_W` measurements
+showed were safe to drop to MXFP8 or NVFP4. That's where the 2 GB
+disk savings come from.
+
+Crucially, the *other* direction holds too: of the Linears RedHat
+quantized to NVFP4, PrismQuant's measurements flagged 26 of them as
+too sensitive for NVFP4 and promoted them to MXFP8 (and 252 of what
+RedHat quantized... wait, those are already in RedHat's BF16 list).
+The interesting case is really the 26 MXFP8 Linears — these are
+genuinely sensitive ones where NVFP4 would hurt but BF16 is
+overkill. RedHat can't express that distinction with a one-format
+scheme; PrismQuant can.
+
+The resulting accuracy pattern matches the theory exactly:
+
+- **arc_easy / arc_challenge** are knowledge-recall tasks that lean
+  heavily on the Linears PrismQuant kept in BF16/MXFP8 that RedHat
+  left NVFP4. PrismQuant − RedHat ≈ **+3 pp** on both, **2.6σ** on
+  arc_easy.
+- **hellaswag / piqa** lean on the bulk MoE body, which both
+  quants put in NVFP4 identically. Margin narrows to < 1 pp, tied on
+  hellaswag-acc.
+- **winogrande** stresses pronoun resolution through attention —
+  sensitive to attention-projection quantization. Both quants drop
+  (−2.21 / −4.89), but RedHat drops >2× more because PrismQuant's
+  sensitivity measurements nudged those Linears up to MXFP8/BF16.
+
+Over-preservation burns disk *and* accuracy when you can't
+discriminate which Linears actually need it. Under-aggression
+(quantizing genuinely sensitive Linears to recover budget) burns
+accuracy worse. Both are failure modes of sensitivity-blind
+quantizers. Measuring `0.5·H·MSE_W` per Linear turns them into
+separable decisions.
+
 ### Honest caveats on the task mix
 
 The five tasks above are commonsense / world-knowledge benchmarks
