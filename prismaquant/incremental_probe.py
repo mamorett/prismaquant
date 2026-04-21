@@ -55,6 +55,7 @@ from .sensitivity_probe import (
     per_token_ce,
     read_top_k,
     run_multimodal_visual_probe_pass,
+    run_streaming_multimodal_visual_probe_pass,
     stage_multimodal,
     stage_text_only,
 )
@@ -1601,7 +1602,13 @@ def main():
         mm_dtype = dtype_map[args.dtype]
         visual_probe_path = work_dir / "shards" / "probe_visual_mm.pkl"
         visual_include = r"^(?:model\.)?visual\."
-        ok = run_multimodal_visual_probe_pass(
+        # Try the streaming path FIRST — it works on both small and huge
+        # multimodal models (122B body streams; visual tower stays fully
+        # resident). Fall back to the monolithic whole-model
+        # `run_multimodal_visual_probe_pass` only if streaming fails
+        # (e.g. unsupported architecture, missing processor).
+        mm_offload = str(work_dir / "streaming_offload_mm")
+        ok = run_streaming_multimodal_visual_probe_pass(
             args.model,
             dataset_name=args.mm_dataset,
             n_samples=args.mm_nsamples,
@@ -1612,8 +1619,26 @@ def main():
             linear_exclude=linear_exclude,
             activation_cache_dir=args.activation_cache_dir,
             output_path=str(visual_probe_path),
+            offload_folder=mm_offload,
             h_detail_dir=args.h_detail_dir,
         )
+        if not ok:
+            print("[incremental] streaming multimodal probe failed; "
+                  "trying monolithic whole-model fallback (fits only when "
+                  "total model weights < RAM)", flush=True)
+            ok = run_multimodal_visual_probe_pass(
+                args.model,
+                dataset_name=args.mm_dataset,
+                n_samples=args.mm_nsamples,
+                max_text_len=args.mm_max_text_len,
+                requested_device=args.device,
+                dtype=mm_dtype,
+                linear_include=visual_include,
+                linear_exclude=linear_exclude,
+                activation_cache_dir=args.activation_cache_dir,
+                output_path=str(visual_probe_path),
+                h_detail_dir=args.h_detail_dir,
+            )
         if not ok:
             print("[incremental] multimodal visual probe skipped / failed; "
                   "allocator will need --visual-format for visual Linears",

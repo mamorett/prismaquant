@@ -85,7 +85,10 @@ class StreamingContext:
                  num_layers: int, install_resolvers: list[dict],
                  weight_shard: dict[str, str], weight_ckpt: dict[str, str],
                  layer_cache: LayerCache, prefetch_pool: ThreadPoolExecutor,
-                 device: torch.device, dtype: torch.dtype, offload_folder: str):
+                 device: torch.device, dtype: torch.dtype, offload_folder: str,
+                 visual_module: Any | None = None,
+                 visual_prefix: str | None = None,
+                 multimodal: bool = False):
         self.model = model
         self.base_model = base_model
         self.layers = layers
@@ -99,6 +102,15 @@ class StreamingContext:
         self.device = device
         self.dtype = dtype
         self.offload_folder = offload_folder
+        # Populated when `_build_streaming_context(..., multimodal=True)`:
+        # full visual tower resident on `device`, requires_grad=True on
+        # Linear params so Fisher hooks fire in run_multimodal_visual_probe_pass.
+        # Also exposes `visual_prefix` so cost / probe code can iterate
+        # over visual Linears under `model.visual.*` (or whatever the
+        # declared multimodal arch calls it).
+        self.visual_module = visual_module
+        self.visual_prefix = visual_prefix
+        self.multimodal = multimodal
         self._inflight: dict[int, Any] = {}
         self._inflight_lock = threading.Lock()
 
@@ -152,31 +164,100 @@ class StreamingContext:
         self.prefetch_pool.shutdown(wait=True)
 
 
+def _resolve_declared_model_cls(config, default_cls):
+    """Return the transformers class named by `config.architectures[0]`
+    if importable, else `default_cls`. Used to bypass
+    `AutoModelForCausalLM`'s silent text-only downgrade for multimodal
+    umbrella configs (e.g. Qwen3_5MoeConfig → Qwen3_5MoeForCausalLM
+    text-only, which drops `model.visual.*`)."""
+    try:
+        import transformers
+        arch_names = getattr(config, "architectures", None) or []
+        if arch_names and hasattr(transformers, arch_names[0]):
+            return getattr(transformers, arch_names[0])
+    except Exception:
+        pass
+    return default_cls
+
+
+def _find_visual_module(model) -> tuple[Any | None, str]:
+    """Return (visual_module, dotted_prefix) if the model has a visual
+    tower; (None, '') otherwise. Handles the v5 multimodal umbrella
+    layout (`model.model.visual`) and a few common variants."""
+    import torch.nn as nn
+    # Most common: `model.model.visual` (Qwen3_5MoeModel.visual)
+    cand = getattr(model, "model", None)
+    if cand is not None:
+        vis = getattr(cand, "visual", None)
+        if isinstance(vis, nn.Module):
+            return vis, "model.visual"
+    # Fallback: top-level `model.visual` (some arch variants)
+    vis = getattr(model, "visual", None)
+    if isinstance(vis, nn.Module):
+        return vis, "visual"
+    return None, ""
+
+
 def _build_streaming_context(model_path: str, *,
                              device: torch.device, dtype: torch.dtype,
                              offload_folder: str,
                              cache_headroom_gb: float = 75.0,
-                             log_prefix: str = "[streaming]") -> StreamingContext:
+                             log_prefix: str = "[streaming]",
+                             multimodal: bool = False,
+                             visual_requires_grad: bool = False,
+                             ) -> StreamingContext:
     """One-time setup: AutoConfig + empty skeleton, from_pretrained with an
     explicit device_map that pins the head resident and every decoder layer
     to disk, then strip accelerate's auto-load hooks and unload each layer
-    back to meta so WE own materialization from this point on."""
+    back to meta so WE own materialization from this point on.
+
+    When `multimodal=True`:
+      - Stages via `stage_multimodal` (preserves vision_config).
+      - Instantiates via `config.architectures[0]` (declared arch) so the
+        visual tower actually materializes — bypasses
+        AutoModelForCausalLM's silent text-only downgrade.
+      - Maps the decoder layers to `"disk"` as usual; the visual tower
+        and head pieces stay resident.
+      - After the skeleton is built, FULLY materializes the visual tower
+        onto `device` (small — 2-3 GB even at 122B scale). Body still
+        streams.
+      - If `visual_requires_grad=True`, flips `.requires_grad_(True)` on
+        every visual Linear's weight so Fisher backward hooks fire when
+        `run_multimodal_visual_probe_pass` drives the combined forward
+        (pixel_values → visual_tower → merged inputs_embeds → streamed
+        body → lm_head → CE)."""
     import psutil
     from accelerate import init_empty_weights
     from accelerate.hooks import remove_hook_from_module
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    from .sensitivity_probe import stage_text_only
+    from .sensitivity_probe import stage_multimodal, stage_text_only
 
-    staged = stage_text_only(model_path)
+    if multimodal:
+        staged = stage_multimodal(model_path)
+    else:
+        staged = stage_text_only(model_path)
     config = AutoConfig.from_pretrained(staged, trust_remote_code=True)
 
+    if multimodal:
+        model_cls = _resolve_declared_model_cls(config, AutoModelForCausalLM)
+    else:
+        model_cls = AutoModelForCausalLM
+
     with init_empty_weights():
-        skeleton = AutoModelForCausalLM.from_config(
-            config, trust_remote_code=True)
+        if model_cls is AutoModelForCausalLM:
+            skeleton = AutoModelForCausalLM.from_config(
+                config, trust_remote_code=True)
+        else:
+            skeleton = model_cls._from_config(config)
     skel_base, skel_layers = _get_layer_list(skeleton)
     base_prefix = _resolve_base_prefix(skeleton, skel_base)
     num_layers = len(skel_layers)
+
+    # Find the visual module on the skeleton so we know which names to
+    # keep resident in device_map. We rebuild these after `from_pretrained`
+    # on the real model anyway — skeleton lookup only tells us the path.
+    _skel_visual, skel_visual_prefix = _find_visual_module(skeleton)
     del skeleton, skel_base, skel_layers
 
     layers_prefix = f"{base_prefix}.layers." if base_prefix else "layers."
@@ -192,13 +273,20 @@ def _build_streaming_context(model_path: str, *,
     for L in range(num_layers):
         device_map[f"{base}.layers.{L}" if base else f"layers.{L}"] = "disk"
 
+    # In multimodal mode, keep the entire visual tower resident so the
+    # Fisher probe's backward sweep can flow gradients into visual
+    # Linears. Visual weights are small (2-3 GB even at 122B scale).
+    if multimodal and skel_visual_prefix:
+        device_map[skel_visual_prefix] = resident_device
+
     os.makedirs(offload_folder, exist_ok=True)
     t0 = time.time()
     print(f"{log_prefix} base_prefix={base_prefix!r}  layers={num_layers}  "
-          f"head_resident_on={resident_device}  offload={offload_folder}",
+          f"head_resident_on={resident_device}  offload={offload_folder}  "
+          f"multimodal={multimodal}  visual_prefix={skel_visual_prefix or 'n/a'}",
           flush=True)
 
-    model = AutoModelForCausalLM.from_pretrained(
+    model = model_cls.from_pretrained(
         staged,
         torch_dtype=dtype,
         device_map=device_map,
@@ -217,7 +305,50 @@ def _build_streaming_context(model_path: str, *,
     for L in range(num_layers):
         _unload(model, [f"{layers_prefix}{L}."])
 
-    weight_shard, weight_ckpt = _build_weight_map(model_path)
+    weight_shard, weight_ckpt = _build_weight_map(model_path, multimodal=multimodal)
+
+    # Locate the actual visual module on the real (post-from_pretrained)
+    # model. When multimodal is set, fully materialize the visual tower
+    # onto `device`: accelerate pinned it to resident_device in the
+    # device_map, but via the `offload_folder` path it may still be
+    # on meta for tensors the loader didn't find in the index. Our
+    # own `_read_layer_to_device` + `_fast_install`-style load catches
+    # any strays reliably.
+    visual_module = None
+    visual_prefix: str | None = None
+    if multimodal:
+        visual_module, visual_prefix = _find_visual_module(model)
+        if visual_module is not None and visual_prefix:
+            # Strip accelerate hooks off the visual tower so we own its
+            # materialization (same hygiene as the decoder layers).
+            remove_hook_from_module(visual_module, recurse=True)
+            # Count how many visual tensors already ended up on meta
+            # (they shouldn't if device_map pinned them resident, but
+            # HF/accelerate can still miss offload_buffers entries).
+            # Install any that are on meta using our streaming primitive.
+            vis_keys = [k for k in weight_shard if k.startswith(visual_prefix + ".")]
+            # Load all visual tensors from safetensors onto device.
+            tensors = _read_layer_to_device(
+                visual_prefix + ".",
+                weight_shard, weight_ckpt, dtype, device)
+            print(f"{log_prefix} materializing visual tower: "
+                  f"{len(tensors)}/{len(vis_keys)} tensors -> {device}", flush=True)
+            from accelerate.utils.modeling import set_module_tensor_to_device
+            for model_name, t in tensors.items():
+                set_module_tensor_to_device(model, model_name, device, value=t)
+            if visual_requires_grad:
+                # Enable grad on every Linear's weight + bias so backward
+                # hooks fire on the reverse sweep. Embeddings and norms
+                # stay frozen (no Fisher tracked for those).
+                import torch.nn as nn
+                n_grad = 0
+                for n, m in visual_module.named_modules():
+                    if isinstance(m, nn.Linear):
+                        for p in m.parameters(recurse=False):
+                            p.requires_grad_(True)
+                            n_grad += 1
+                print(f"{log_prefix} visual: enabled grad on "
+                      f"{n_grad} Linear params", flush=True)
     print(f"{log_prefix} model ready in {time.time()-t0:.1f}s", flush=True)
 
     print(f"{log_prefix} building install resolvers for {num_layers} layers ...",
@@ -252,4 +383,7 @@ def _build_streaming_context(model_path: str, *,
         weight_shard=weight_shard, weight_ckpt=weight_ckpt,
         layer_cache=layer_cache, prefetch_pool=prefetch_pool,
         device=device, dtype=dtype, offload_folder=offload_folder,
+        visual_module=visual_module,
+        visual_prefix=visual_prefix,
+        multimodal=multimodal,
     )

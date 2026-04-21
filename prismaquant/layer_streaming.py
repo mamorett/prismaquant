@@ -26,7 +26,9 @@ from accelerate.utils.modeling import set_module_tensor_to_device
 from safetensors import safe_open
 
 
-def _build_weight_map(model_path: str) -> tuple[dict[str, str], dict[str, str]]:
+def _build_weight_map(model_path: str, *,
+                      multimodal: bool = False
+                      ) -> tuple[dict[str, str], dict[str, str]]:
     """Return ({model_key: shard_path}, {model_key: checkpoint_key}).
 
     Multimodal umbrella checkpoints store tensors under
@@ -39,8 +41,14 @@ def _build_weight_map(model_path: str) -> tuple[dict[str, str], dict[str, str]]:
 
     Also drops keys the text-only probe never needs (visual encoder,
     audio encoder, MTP — those follow their own code paths and would
-    shadow real body tensors if they share suffixes)."""
-    def _rename(k: str) -> str | None:
+    shadow real body tensors if they share suffixes).
+
+    When `multimodal=True` the multimodal umbrella arch is used in the
+    streaming skeleton (body at `model.language_model.layers.X.*`,
+    visual at `model.visual.*`); no rename is applied and visual/audio
+    keys are preserved so `_materialize` can load them onto the visual
+    tower. MTP stays dropped — MTP has its own synthesis path."""
+    def _rename_text_only(k: str) -> str | None:
         # Prefix renames mirroring vLLM's `hf_to_vllm_mapper` for the
         # multimodal → text-only body remap. Order matters: more
         # specific rules first.
@@ -53,6 +61,18 @@ def _build_weight_map(model_path: str) -> tuple[dict[str, str], dict[str, str]]:
         if k.startswith("model.language_model."):
             return "model." + k[len("model.language_model."):]
         return k
+
+    def _rename_multimodal(k: str) -> str | None:
+        # Multimodal umbrella keeps `model.language_model.layers.*` and
+        # `model.visual.*` verbatim — they already match the declared
+        # multimodal model's named modules. MTP weights follow a
+        # separate synthesis path; drop them so they don't shadow
+        # anything.
+        if k.startswith("mtp."):
+            return None
+        return k
+
+    _rename = _rename_multimodal if multimodal else _rename_text_only
 
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.exists(index_file):
@@ -327,11 +347,18 @@ def _get_layer_list(model: nn.Module):
     past any `ForConditionalGeneration` / `ForCausalLM` wrapper to
     find the decoder layers."""
     # Typical layouts:
-    #   model.model.layers
-    #   model.language_model.model.layers
+    #   model.model.layers                              — text-only CausalLM
+    #   model.language_model.model.layers               — pre-v5 multimodal
+    #   model.model.language_model.layers               — v5 multimodal umbrella
+    #                                                     (Qwen3_5MoeForConditionalGeneration)
     cand = getattr(model, "model", None)
     if cand is not None and hasattr(cand, "layers"):
         return cand, cand.layers
+    # v5 multimodal: model.model wraps .visual + .language_model
+    if cand is not None:
+        lm = getattr(cand, "language_model", None)
+        if lm is not None and hasattr(lm, "layers"):
+            return lm, lm.layers
     lm = getattr(model, "language_model", None)
     if lm is not None:
         inner = getattr(lm, "model", lm)

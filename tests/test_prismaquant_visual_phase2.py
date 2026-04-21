@@ -29,7 +29,7 @@ from unittest import mock
 import torch
 import torch.nn as nn
 
-from prismaquant.sensitivity_probe import (
+from quantization.prismaquant.sensitivity_probe import (
     _synthetic_multimodal_calibration_samples,
     load_multimodal_calibration,
     stage_multimodal,
@@ -162,7 +162,7 @@ class TestMultimodalProbeFlagParsing(unittest.TestCase):
     def test_flags_in_incremental_probe_argparser(self):
         # Import the module's argparser the way main() does, but without
         # triggering the heavy run.
-        from prismaquant import incremental_probe
+        from quantization.prismaquant import incremental_probe
 
         src = inspect_source(incremental_probe.main)
         # The flag surface we expose should be discoverable in main()'s
@@ -175,7 +175,7 @@ class TestMultimodalProbeFlagParsing(unittest.TestCase):
         self.assertIn("--mm-max-text-len", src)
 
     def test_default_calibration_modality_is_text_only(self):
-        from prismaquant import incremental_probe
+        from quantization.prismaquant import incremental_probe
         src = inspect_source(incremental_probe.main)
         # Search for the default= in the argparse add_argument.
         self.assertIn('default="text-only"', src)
@@ -191,16 +191,20 @@ class TestVisualCostShardBasic(unittest.TestCase):
     without raising, and emits a shard pickle the merger can consume."""
 
     def test_empty_shard_when_no_matching_stats(self):
-        from prismaquant.incremental_measure_quant_cost import (
+        from quantization.prismaquant.incremental_measure_quant_cost import (
             _run_visual_cost_shard,
         )
-        from prismaquant import format_registry as fr
+        from quantization.prismaquant import format_registry as fr
 
         specs = [fr.get_format("BF16"), fr.get_format("NVFP4")]
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             out = td / "cost_shard.pkl"
             act_cache = mock.Mock()
+            # New signature: returns `mm_ctx` (StreamingContext or None).
+            # For an empty probe_stats shard, the function short-circuits
+            # before building any context — so mm_ctx stays None. What
+            # we care about is that an empty pickle was emitted.
             result = _run_visual_cost_shard(
                 model_path=str(td),
                 linear_include=r"^model\.visual\.",
@@ -215,8 +219,11 @@ class TestVisualCostShardBasic(unittest.TestCase):
                 output_path=str(out),
                 model_name=str(td),
                 probe_path="probe.pkl",
+                mm_ctx=None,
+                mm_offload_folder=str(td / "offload"),
             )
-            self.assertTrue(result)
+            # Empty-shard short-circuit never builds a context.
+            self.assertIsNone(result)
             self.assertTrue(out.exists())
             with open(out, "rb") as f:
                 data = pickle.load(f)
@@ -226,13 +233,13 @@ class TestVisualCostShardBasic(unittest.TestCase):
             self.assertEqual(data["formats"], ["BF16", "NVFP4"])
 
     def test_visual_shard_writes_empty_pickle_on_load_oom(self):
-        """When AutoModelForCausalLM.from_pretrained raises CUDA OOM, we
-        fall back to an empty pickle instead of raising — 122B-scale
+        """When the multimodal streaming context build raises CUDA OOM,
+        we fall back to an empty pickle instead of raising — 122B-scale
         behavior."""
-        from prismaquant.incremental_measure_quant_cost import (
+        from quantization.prismaquant.incremental_measure_quant_cost import (
             _run_visual_cost_shard,
         )
-        from prismaquant import format_registry as fr
+        from quantization.prismaquant import format_registry as fr
 
         specs = [fr.get_format("BF16")]
         with tempfile.TemporaryDirectory() as td:
@@ -247,13 +254,15 @@ class TestVisualCostShardBasic(unittest.TestCase):
             probe_stats = {
                 "model.visual.blocks.0.attn.qkv": {"n_params": 100},
             }
-            # Patch from_pretrained to raise a plain RuntimeError with
-            # "out of memory" in the message — the guard should catch
-            # that as an OOM proxy and fall back gracefully.
+            # Patch the streaming-context builder to raise a plain
+            # RuntimeError with "out of memory" in the message — the
+            # guard should catch that as an OOM proxy and fall back
+            # gracefully with an empty pickle.
             with mock.patch(
-                    "transformers.AutoModelForCausalLM.from_pretrained",
+                    "quantization.prismaquant.incremental_measure_quant_cost."
+                    "_build_streaming_context",
                     side_effect=RuntimeError("CUDA out of memory")):
-                ok = _run_visual_cost_shard(
+                result = _run_visual_cost_shard(
                     model_path=str(td),
                     linear_include=r"^model\.visual\.",
                     probe_stats=probe_stats,
@@ -267,10 +276,12 @@ class TestVisualCostShardBasic(unittest.TestCase):
                     output_path=str(out),
                     model_name=str(td),
                     probe_path="probe.pkl",
+                    mm_ctx=None,
+                    mm_offload_folder=str(td / "offload"),
                 )
-            # OOM path returns False but writes an empty pickle so the
-            # merge layout stays consistent.
-            self.assertFalse(ok)
+            # OOM path returns None (no context built) but writes an
+            # empty pickle so the merge layout stays consistent.
+            self.assertIsNone(result)
             self.assertTrue(out.exists())
             with open(out, "rb") as f:
                 data = pickle.load(f)
@@ -287,7 +298,7 @@ class TestAllocatorVisualSensitivityModes(unittest.TestCase):
     def test_visual_fisher_available_detects_both_probe_and_cost(self):
         # Helper replicated here since it's defined inside main(); we
         # test its guts via the public flow below.
-        from prismaquant.allocator import _is_visual_linear
+        from quantization.prismaquant.allocator import _is_visual_linear
         body = {"model.layers.0.self_attn.q_proj": 1,
                 "mtp.layers.0.mlp.gate_proj": 1}
         visual = {"model.visual.blocks.0.attn.qkv": 1}
@@ -300,7 +311,7 @@ class TestAllocatorVisualSensitivityModes(unittest.TestCase):
         # When --visual-sensitivity=uniform, visual Linears are stamped
         # with --visual-format regardless of whether probe had them.
         # This is the Phase 1 path preserved.
-        from prismaquant.allocator import (
+        from quantization.prismaquant.allocator import (
             apply_visual_format_override,
         )
         assignment = {
@@ -315,7 +326,7 @@ class TestAllocatorVisualSensitivityModes(unittest.TestCase):
         # Replicate the _visual_fisher_available predicate at test level:
         # a probe+cost combo is "Fisher available" iff both carry at
         # least one visual-prefix entry.
-        from prismaquant.allocator import _is_visual_linear
+        from quantization.prismaquant.allocator import _is_visual_linear
 
         stats_with = {"model.visual.blocks.0.attn.qkv": {}}
         stats_without = {"model.layers.0.self_attn.q_proj": {}}
@@ -339,7 +350,7 @@ class TestQuantize2DVisualActivationsRoundtrip(unittest.TestCase):
     — this test confirms the cache lookup triggers the AWQ pass."""
 
     def test_awq_enabled_reads_visual_activations_from_cache(self):
-        from prismaquant import export_native_compressed as exp
+        from quantization.prismaquant import export_native_compressed as exp
 
         visual_name = "model.visual.blocks.0.attn.qkv"
         # Rank-2 weight with in_features divisible by NVFP4 group_size=16.
@@ -371,7 +382,7 @@ class TestQuantize2DVisualActivationsRoundtrip(unittest.TestCase):
         # If _CACHED_ACTIVATIONS doesn't have the visual key, AWQ is a
         # no-op (the path checks `acts is not None` at each step).
         # Still produces a valid NVFP4 triple.
-        from prismaquant import export_native_compressed as exp
+        from quantization.prismaquant import export_native_compressed as exp
 
         visual_name = "model.visual.merger.mlp.0"
         W = torch.randn(32, 32, dtype=torch.bfloat16)
@@ -394,7 +405,7 @@ class TestQuantize2DVisualActivationsRoundtrip(unittest.TestCase):
         # produce the same-shape packed output as a body Linear of the
         # same weight shape — sanity that the cache lookup is name-
         # agnostic beyond the dictionary indexing.
-        from prismaquant import export_native_compressed as exp
+        from quantization.prismaquant import export_native_compressed as exp
 
         W = torch.randn(32, 32, dtype=torch.bfloat16)
         acts = torch.randn(64, 32, dtype=torch.float32)
@@ -425,7 +436,7 @@ class TestMultimodalProbePassIntegration(unittest.TestCase):
     failed) — no partial pickle is written."""
 
     def test_zero_triples_returns_false(self):
-        from prismaquant import sensitivity_probe as sp
+        from quantization.prismaquant import sensitivity_probe as sp
 
         with tempfile.TemporaryDirectory() as td:
             tdp = Path(td)
@@ -458,7 +469,7 @@ class TestMultimodalProbePassIntegration(unittest.TestCase):
             self.assertFalse(out.exists())
 
     def test_processor_load_failure_returns_false(self):
-        from prismaquant import sensitivity_probe as sp
+        from quantization.prismaquant import sensitivity_probe as sp
 
         with tempfile.TemporaryDirectory() as td:
             tdp = Path(td)

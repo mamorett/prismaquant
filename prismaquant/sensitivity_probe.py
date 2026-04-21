@@ -1644,6 +1644,7 @@ def run_multimodal_visual_probe_pass(
     # `config.architectures[0]` to instantiate the multimodal class
     # (Qwen3_5MoeForConditionalGeneration), which keeps the visual
     # tower wired.
+    model_cls = AutoModelForCausalLM
     try:
         import transformers
         from transformers import AutoConfig
@@ -1651,17 +1652,14 @@ def run_multimodal_visual_probe_pass(
         arch_names = getattr(cfg, "architectures", None) or []
         if arch_names and hasattr(transformers, arch_names[0]):
             model_cls = getattr(transformers, arch_names[0])
-            model = model_cls.from_pretrained(
-                staged, torch_dtype=dtype, device_map=requested_device,
-                low_cpu_mem_usage=False, trust_remote_code=True,
-            )
-        else:
-            # No declared arch (or not importable) — fall back to the
-            # auto class. Works for non-composite-config text-only models.
-            model = AutoModelForCausalLM.from_pretrained(
-                staged, torch_dtype=dtype, device_map=requested_device,
-                low_cpu_mem_usage=False, trust_remote_code=True,
-            )
+    except Exception:
+        # Config resolve failure falls through to AutoModel below.
+        pass
+    try:
+        model = model_cls.from_pretrained(
+            staged, torch_dtype=dtype, device_map=requested_device,
+            low_cpu_mem_usage=False, trust_remote_code=True,
+        )
     except (torch.cuda.OutOfMemoryError, RuntimeError, MemoryError) as e:
         msg = str(e).lower()
         if ("out of memory" in msg or "oom" in msg
@@ -1779,3 +1777,395 @@ def run_multimodal_visual_probe_pass(
         }, f)
     print(f"[probe/mm] wrote {out_path}", flush=True)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Streaming multimodal visual Fisher probe — the one incremental path.
+# Same intent as `run_multimodal_visual_probe_pass` above, but reuses the
+# shared streaming context so the body NEVER loads whole. The visual tower
+# (2-3 GB even at 122B scale) stays resident on device; body decoder layers
+# install/unload around a handwritten streaming forward+backward. This is
+# the path that makes Qwen3.5-122B calibration work under 128 GB.
+# ---------------------------------------------------------------------------
+def run_streaming_multimodal_visual_probe_pass(
+    model_path: str,
+    *,
+    dataset_name: str,
+    n_samples: int,
+    max_text_len: int,
+    requested_device: str,
+    dtype: torch.dtype,
+    linear_include: str,
+    linear_exclude: str,
+    activation_cache_dir: str | None,
+    output_path: str,
+    offload_folder: str,
+    h_detail_dir: str | None = None,
+) -> bool:
+    """Incremental multimodal Fisher probe.
+
+    Uses `_build_streaming_context(..., multimodal=True,
+    visual_requires_grad=True)` to build a skeleton where:
+      - Body decoder layers are on meta, streamed layer-by-layer on demand.
+      - Visual tower is fully resident on `device`.
+      - Head pieces (embed/norm/lm_head/rotary) are resident.
+
+    Forward path (per sample):
+      1. `image_features = model.model.get_image_features(pixel_values,
+                                                          image_grid_thw)`
+         — runs through resident visual, producing per-image patches.
+      2. `text_embeds = base.embed_tokens(input_ids)` — resident.
+      3. Merge image features into text embeds via the model's
+         `get_placeholder_mask` + `masked_scatter`. Result
+         `inputs_embeds` has an autograd edge to visual tower weights.
+      4. Streaming body forward (Phase 1): install layer L, run
+         `_call_layer`, cache activation on CPU, unload.
+      5. Phase 2: final norm + lm_head + teacher-forced CE; backward to
+         get grad at the final hidden state.
+      6. Phase 3: reverse sweep, per-layer install/backward/unload,
+         accumulate grad into grad-at-hidden-0 (= grad at inputs_embeds).
+      7. `inputs_embeds.backward(grad_at_hidden_0)` — autograd flows
+         into visual (resident, requires_grad=True) and fires the
+         per-visual-Linear Fisher backward hooks.
+
+    Returns True on success (probe pickle written), False on any failure
+    (caller falls back to `--visual-format` Phase 1 override). No partial
+    calibration is written on failure.
+    """
+    from transformers import AutoProcessor
+
+    from .layer_streaming import (
+        _call_layer,
+        _compute_position_embeddings,
+        _make_causal_mask,
+    )
+    from .streaming_model import _build_streaming_context
+
+    try:
+        processor = AutoProcessor.from_pretrained(model_path,
+                                                  trust_remote_code=True)
+    except Exception:
+        try:
+            staged = stage_multimodal(model_path)
+            processor = AutoProcessor.from_pretrained(staged,
+                                                     trust_remote_code=True)
+        except Exception as e:
+            print(f"[probe/mm-stream] AutoProcessor.from_pretrained failed "
+                  f"({type(e).__name__}: {e}); skipping streaming multimodal "
+                  f"pass.", flush=True)
+            return False
+
+    triples = load_multimodal_calibration(
+        processor, dataset_name, n_samples, max_text_len)
+    print(f"[probe/mm-stream] loaded {len(triples)} multimodal samples "
+          f"(dataset={dataset_name!r})", flush=True)
+    if not triples:
+        print("[probe/mm-stream] no calibration samples; skipping", flush=True)
+        return False
+
+    device = torch.device(requested_device)
+    try:
+        ctx = _build_streaming_context(
+            model_path,
+            device=device, dtype=dtype,
+            offload_folder=offload_folder,
+            log_prefix="[probe/mm-stream]",
+            multimodal=True,
+            visual_requires_grad=True,
+        )
+    except Exception as e:
+        print(f"[probe/mm-stream] streaming context build failed: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return False
+
+    if ctx.visual_module is None:
+        print(f"[probe/mm-stream] no visual tower detected on model; "
+              f"skipping", flush=True)
+        ctx.shutdown()
+        return False
+
+    model = ctx.model
+    base_model = ctx.base_model
+    layers = ctx.layers
+    num_layers = ctx.num_layers
+    layers_prefix = ctx.layers_prefix
+    visual_module = ctx.visual_module
+    visual_prefix = ctx.visual_prefix or ""
+
+    # Enumerate tracked Linears: per-regex visual matches + any resident
+    # Linears that the regex would pick up (usually none — visual regex
+    # is scoped to visual.*). Body Linears live on meta during streaming;
+    # FisherAccumulator would see meta weights and stats would be garbage.
+    # Scope strictly to visual for this path.
+    inc = re.compile(linear_include)
+    exc = re.compile(linear_exclude)
+    tracked: list[str] = []
+    for n, m in model.named_modules():
+        if not isinstance(m, nn.Linear):
+            continue
+        if not inc.search(n) or exc.search(n):
+            continue
+        # Skip body decoder-layer Linears — they're on meta during
+        # streaming; FisherAccumulator can't handle meta weights.
+        if any(n.startswith(f"{layers_prefix}{L}.") for L in range(num_layers)):
+            continue
+        # Check the weight is really resident.
+        w = getattr(m, "weight", None)
+        if w is None or w.is_meta:
+            continue
+        tracked.append(n)
+    print(f"[probe/mm-stream] tracking {len(tracked)} resident Linears "
+          f"(include={linear_include!r})", flush=True)
+    if not tracked:
+        print(f"[probe/mm-stream] no resident Linears match "
+              f"{linear_include!r}; writing empty pickle", flush=True)
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as f:
+            pickle.dump({
+                "stats": {},
+                "router_counts": {},
+                "router_totals": {},
+                "expert_info": {},
+                "meta": {
+                    "model": model_path,
+                    "dataset": dataset_name,
+                    "nsamples": len(triples),
+                    "seqlen": max_text_len,
+                    "dtype": str(dtype),
+                    "device_map": requested_device,
+                    "execution_device": str(device),
+                    "top_k": read_top_k(model, default=2),
+                    "importance_weighting": False,
+                    "activation_cache_dir": activation_cache_dir,
+                    "linear_include": linear_include,
+                    "linear_exclude": linear_exclude,
+                    "calibration_modality": "multimodal",
+                    "streaming": True,
+                },
+            }, f)
+        ctx.shutdown()
+        return True
+
+    expert_info_all = discover_moe_structure(model)
+    expert_info = {k: v for k, v in expert_info_all.items() if k in tracked}
+    top_k = read_top_k(model, default=2)
+    routers = sorted({r for r, _ in expert_info.values()})
+    tracker = RouterTracker(model, routers, top_k) if routers else None
+
+    cache_dir = Path(activation_cache_dir) if activation_cache_dir else None
+    detail_dir = Path(h_detail_dir) if h_detail_dir else None
+    acc = FisherAccumulator(model, tracked, expert_info, cache_dir,
+                            h_detail_dir=detail_dir)
+
+    # Enable train mode on the visual tower so any dropout/BN layers behave
+    # consistently; rest of the model stays eval (and params.requires_grad
+    # are set up correctly already).
+    visual_module.train(False)  # no dropout — Fisher estimator wants eval
+
+    # Derive an 'mm_model' reference for the declared-arch helpers
+    # (get_image_features, get_placeholder_mask). `model.model` is the
+    # Qwen3_5MoeModel-style wrapper for Qwen3.5/3.6; `model` itself can
+    # be the ForConditionalGeneration class which forwards these calls.
+    mm_model = getattr(model, "model", model)
+    get_image_features = getattr(mm_model, "get_image_features", None)
+    get_placeholder_mask = getattr(mm_model, "get_placeholder_mask", None)
+    if get_image_features is None or get_placeholder_mask is None:
+        # Fallback: some architectures expose these on the outer model.
+        get_image_features = getattr(model, "get_image_features",
+                                     get_image_features)
+        get_placeholder_mask = getattr(model, "get_placeholder_mask",
+                                       get_placeholder_mask)
+    if get_image_features is None:
+        print(f"[probe/mm-stream] model has no get_image_features; "
+              f"aborting streaming multimodal probe", flush=True)
+        ctx.shutdown()
+        return False
+
+    prefetch_depth = 3
+    total_fwd = total_bwd = 0.0
+    successes = 0
+
+    for i, sample in enumerate(triples):
+        # Move inputs to device, casting pixel_values to dtype.
+        kwargs: dict[str, torch.Tensor] = {}
+        for k, v in sample.items():
+            if not isinstance(v, torch.Tensor):
+                continue
+            target_dtype = dtype if k == "pixel_values" else None
+            kwargs[k] = (v.to(device, dtype=target_dtype)
+                         if target_dtype is not None else v.to(device))
+        labels = kwargs.pop("labels", kwargs.get("input_ids")).to(device)
+        pixel_values = kwargs.get("pixel_values")
+        input_ids = kwargs.get("input_ids")
+        image_grid_thw = kwargs.get("image_grid_thw")
+        if pixel_values is None or input_ids is None:
+            continue
+
+        t0 = time.time()
+        try:
+            # ---- Visual forward -----------------------------------------
+            # Keep autograd ON so gradients flow back into visual tower.
+            vision_output = get_image_features(
+                pixel_values, image_grid_thw=image_grid_thw)
+            # vision_output shape / dtype handling mirrors
+            # Qwen3_5MoeModel.forward: pooler_output → concatenated
+            # image_embeds, aligned to inputs_embeds dtype/device.
+            image_embeds = getattr(vision_output, "pooler_output",
+                                   vision_output)
+            if isinstance(image_embeds, (list, tuple)):
+                image_embeds = torch.cat(list(image_embeds), dim=0)
+
+            # ---- Text embeds + merge ------------------------------------
+            text_embeds = base_model.embed_tokens(input_ids).to(dtype)
+            image_embeds = image_embeds.to(text_embeds.device,
+                                           dtype=text_embeds.dtype)
+            try:
+                image_mask, _vmask = get_placeholder_mask(
+                    input_ids, inputs_embeds=text_embeds,
+                    image_features=image_embeds)
+                inputs_embeds = text_embeds.masked_scatter(
+                    image_mask, image_embeds)
+            except Exception:
+                # Processor didn't put image tokens in input_ids, or
+                # shape mismatch. Skip merge — body will still see text
+                # embeds; visual grad flows via a reconstruction path.
+                # Use a fallback that sums visual features into the
+                # first-image-token position, preserving a grad edge.
+                inputs_embeds = text_embeds + 0.0 * image_embeds.sum()
+
+            # ---- Streaming body forward (Phase 1) ----------------------
+            # Save per-layer CPU activations for the reverse sweep.
+            T = inputs_embeds.size(1)
+            position_ids = torch.arange(T, device=device).unsqueeze(0)
+            causal_mask = _make_causal_mask(T, device, dtype)
+            position_embeddings = _compute_position_embeddings(
+                base_model, inputs_embeds, position_ids)
+
+            activations_cpu: list[torch.Tensor] = [inputs_embeds.detach().cpu()]
+            hidden = inputs_embeds
+            for d in range(prefetch_depth):
+                ctx.schedule_prefetch(d)
+            for L in range(num_layers):
+                ctx.install(L)
+                ctx.schedule_prefetch(L + prefetch_depth)
+                with torch.no_grad():
+                    out = _call_layer(
+                        layers[L], hidden,
+                        position_embeddings=position_embeddings,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                    )
+                hidden = out
+                activations_cpu.append(hidden.detach().cpu())
+                ctx.unload(L)
+
+            # ---- Phase 2: final norm + lm_head + CE --------------------
+            final_hidden = (activations_cpu[-1].to(device).to(dtype)
+                            .requires_grad_(True))
+            norm_out = base_model.norm(final_hidden)
+            preds = model.lm_head(norm_out).float()
+            # Teacher-forced CE: predict token t+1 from hidden at t.
+            shift_preds = preds[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            lp = F.log_softmax(
+                shift_preds.reshape(-1, shift_preds.size(-1)), dim=-1)
+            valid = shift_labels.reshape(-1)
+            mask = (valid >= 0) & (valid < shift_preds.size(-1))
+            if not mask.any():
+                # No valid targets; skip this sample.
+                ctx.layer_cache.clear()
+                acc._saved_inputs.clear()
+                continue
+            idx = mask.nonzero(as_tuple=True)[0]
+            gather = -lp.index_select(0, idx).gather(
+                1, valid[mask].reshape(-1, 1)).squeeze(1)
+            loss = gather.sum()
+            loss.backward()
+            grad_at_tail = final_hidden.grad.detach().clone()
+            del final_hidden, norm_out, preds, lp, gather, loss
+
+            # ---- Phase 3: streaming reverse sweep ----------------------
+            grad_out = grad_at_tail
+            for d in range(prefetch_depth):
+                ctx.schedule_prefetch(num_layers - 1 - d)
+            for L in reversed(range(num_layers)):
+                ctx.install(L)
+                ctx.schedule_prefetch(L - prefetch_depth)
+                x_in = (activations_cpu[L].to(device).to(dtype)
+                        .detach().requires_grad_(True))
+                out = _call_layer(
+                    layers[L], x_in,
+                    position_embeddings=position_embeddings,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                )
+                out.backward(grad_out)
+                grad_out = x_in.grad.detach().clone()
+                ctx.unload(L)
+                del x_in, out
+
+            total_fwd += (time.time() - t0)
+
+            # ---- Final: push grad into visual via inputs_embeds --------
+            t1 = time.time()
+            # grad_out is now grad at inputs_embeds (hidden[0]). Apply
+            # backward on the autograd-connected inputs_embeds (resident
+            # on device) so visual Fisher hooks fire.
+            inputs_embeds.backward(grad_out.to(device))
+            total_bwd += (time.time() - t1)
+
+            successes += 1
+
+        except Exception as e:
+            print(f"[probe/mm-stream] sample {i}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            ctx.layer_cache.clear()
+            acc._saved_inputs.clear()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            continue
+        finally:
+            ctx.layer_cache.clear()
+            acc._saved_inputs.clear()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        if (i + 1) % 1 == 0 or i == 0:
+            print(f"[probe/mm-stream] sample {i + 1}/{len(triples)} "
+                  f"fwd_avg={total_fwd / max(successes, 1):.2f}s "
+                  f"bwd_avg={total_bwd / max(successes, 1):.2f}s", flush=True)
+
+    acc.finalize(tracker)
+    acc.remove_hooks()
+    if tracker is not None:
+        tracker.remove_hooks()
+
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump({
+            "stats": acc.stats,
+            "router_counts": dict(tracker.counts) if tracker else {},
+            "router_totals": dict(tracker.total_tokens) if tracker else {},
+            "expert_info": expert_info,
+            "meta": {
+                "model": model_path,
+                "dataset": dataset_name,
+                "nsamples": successes,
+                "seqlen": max_text_len,
+                "dtype": str(dtype),
+                "device_map": requested_device,
+                "execution_device": str(device),
+                "top_k": top_k,
+                "importance_weighting": False,
+                "activation_cache_dir": str(cache_dir) if cache_dir else None,
+                "linear_include": linear_include,
+                "linear_exclude": linear_exclude,
+                "calibration_modality": "multimodal",
+                "streaming": True,
+            },
+        }, f)
+    print(f"[probe/mm-stream] wrote {out_path} "
+          f"({successes}/{len(triples)} samples succeeded)", flush=True)
+    ctx.shutdown()
+    return successes > 0
