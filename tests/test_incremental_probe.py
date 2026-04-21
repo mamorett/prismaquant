@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from prismquant.incremental_probe import (
+from prismaquant.incremental_probe import (
     build_layer_shard_regexes,
     merge_probe_pickles,
 )

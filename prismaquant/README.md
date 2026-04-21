@@ -1,8 +1,8 @@
-# prismaquant
+# PrismaQuant
 
 **Mixed-precision quantization for LLMs. Every layer refracts into a different format based on its sensitivity.**
 
-prismaquant measures the actual per-layer curvature of the loss and the
+PrismaQuant measures the actual per-layer curvature of the loss and the
 actual per-(layer, format) quantization error, then runs a proper
 multi-choice knapsack to choose each layer's format under a total-bit
 budget. It produces a `compressed-tensors` checkpoint that vLLM serves
@@ -20,7 +20,7 @@ budget. It produces a `compressed-tensors` checkpoint that vLLM serves
 - Qwen3.5 / 3.6 fused-sibling groups (q/k/v, gate/up, `in_proj_qkv+z`,
   `in_proj_a+b`) are promoted to share a `weight_global_scale` so vLLM's
   fused loader doesn't warn about scale divergence.
-- **Zero vLLM patches.** The output of prismaquant is a standard
+- **Zero vLLM patches.** The output of PrismaQuant is a standard
   `compressed-tensors` checkpoint, parsed by vLLM's stock loader. No
   custom kernels, no forked serving stack. `vllm serve` the artifact
   and go.
@@ -52,7 +52,7 @@ context length, batch size, or the next model in the rotation. Getting
 the weight format right on a per-Linear basis is the difference between
 running one model at high quality and running three.
 
-prismaquant replaces those heuristics with a closed-form per-Linear
+PrismaQuant replaces those heuristics with a closed-form per-Linear
 cost estimate:
 
     Δloss ≈ 0.5 · H_trace · MSE_W
@@ -80,7 +80,7 @@ that's the API. There's no way to tell it "this specific `down_proj` in
 layer 23 is curvature-sensitive; leave it in BF16 and spend those 12
 bits somewhere less sensitive."
 
-prismaquant operates one level up. It's not a rounding algorithm — it's
+PrismaQuant operates one level up. It's not a rounding algorithm — it's
 a format **allocator** that composes on top of RTN, AutoRound, GPTQ, or
 any other per-Linear quantizer you want to plug into
 `format_registry.py`. The `FormatSpec` for each format carries its own
@@ -94,19 +94,19 @@ quality-vs-size Pareto curve.
 
 vLLM's compressed-tensors loader accepts a specific set of
 format/strategy combinations (NVFP4 `tensor_group g=16`, FP8 `channel`
-W8A8, BF16 passthrough, and a few more). prismaquant's allocator is
+W8A8, BF16 passthrough, and a few more). PrismaQuant's allocator is
 explicitly aware of those constraints — you can't ask for a format
 vLLM can't serve. That's why the initial release targets **exactly the
 subset vLLM supports natively** (NVFP4 + FP8 W8A8 + BF16) and requires
 **zero vLLM changes**. If vLLM's constraints change, the
-`format_registry.py` adapts; until they do, every prismaquant artifact
+`format_registry.py` adapts; until they do, every PrismaQuant artifact
 is a drop-in `--quantization compressed-tensors` target.
 
 The bigger opportunity — and the immediate next roadmap item — is
 **targeting a fixed memory footprint** rather than a fixed bits-per-parameter.
 Currently you ask the allocator for `--target-bits 4.75`. What you
 actually want to ask it is "make the artifact fit 24 GB with the KV
-budget I need at 8K context." The Pareto curve prismaquant already
+budget I need at 8K context." The Pareto curve PrismaQuant already
 computes has exactly this information (bits vs. Δloss vs. disk size).
 Wiring a size-target mode on top is a day of work, not a research
 project, and unlocks direct comparisons like:
@@ -115,14 +115,14 @@ project, and unlocks direct comparisons like:
   - **DGX Spark (128 GB)** — how large can an MoE get before the KV
     budget dominates?
 
-Once that lands, prismaquant goes from "allocator that optimizes bpp"
+Once that lands, PrismaQuant goes from "allocator that optimizes bpp"
 to "allocator that fits your hardware."
 
 ## Validated result
 
 Qwen3.6-35B-A3B-MoE at target **4.75 bpp**:
 
-| Metric | Source BF16 | prismaquant | Delta |
+| Metric | Source BF16 | PrismaQuant | Delta |
 |---|---:|---:|---:|
 | Size on disk | 70 GB | **22 GB** | −69 % |
 | Body format mix | 100 % BF16 | 124 × NVFP4 + 26 × MXFP8 + 252 × BF16 | |
@@ -144,7 +144,7 @@ on the same vLLM server config (FP8 KV cache, FlashInfer backend,
 prefix caching, `num_concurrent=16`), zero-shot, loglikelihood
 scoring via lm-evaluation-harness.
 
-| Task | Metric | BF16 (70 GB) | **prismaquant 4.75 bpp (22 GB)** | RedHat NVFP4 (24 GB) | Δ PQ−BF16 | Δ RH−BF16 | **Δ PQ−RH** |
+| Task | Metric | BF16 (70 GB) | **PrismaQuant 4.75 bpp (22 GB)** | RedHat NVFP4 (24 GB) | Δ PQ−BF16 | Δ RH−BF16 | **Δ PQ−RH** |
 |---|---|---:|---:|---:|---:|---:|---:|
 | arc_easy      | acc      | 81.23 ± 0.80 | **80.72 ± 0.81** | 77.61 ± 0.86 | −0.51 | **−3.62** | **+3.11** |
 | arc_easy      | acc_norm | 71.76 ± 0.92 | **72.26 ± 0.92** | 69.49 ± 0.94 | **+0.51** | −2.27 | **+2.78** |
@@ -158,22 +158,22 @@ scoring via lm-evaluation-harness.
 
 **Headline numbers**:
 
-- Mean Δ vs BF16: prismaquant **−0.56 pp**, RedHat **−2.21 pp** (~4×
+- Mean Δ vs BF16: PrismaQuant **−0.56 pp**, RedHat **−2.21 pp** (~4×
   closer to BF16 on average).
-- prismaquant wins **8 / 9 metrics** vs RedHat (hellaswag-acc is a
+- PrismaQuant wins **8 / 9 metrics** vs RedHat (hellaswag-acc is a
   0.02 pp tie). Sign test p < 0.02.
 - Biggest single-task gap: **arc_easy −3.62 pp** on RedHat vs
-  −0.51 pp on prismaquant — a 3.11 pp prismaquant advantage at a
+  −0.51 pp on PrismaQuant — a 3.11 pp PrismaQuant advantage at a
   combined stderr of 1.18 pp → **2.6σ, statistically significant**.
 - arc_easy also shows the pathology the Motivation section warned
   about: when every Linear gets NVFP4 with only a hand-picked ignore
   list, the ~5 % of genuinely sensitive Linears collapse the whole
-  task. prismaquant's sensitivity-driven allocation keeps them in BF16
+  task. PrismaQuant's sensitivity-driven allocation keeps them in BF16
   or MXFP8 and recovers 3 pp of accuracy for **2 GB less on disk**.
 
 **What this says about the allocator**: RedHat's checkpoint is one
 format group with one regex target and 342 hand-picked ignores. At
-equivalent size, prismaquant's 252 BF16 + 26 MXFP8 + 124 NVFP4 mix
+equivalent size, PrismaQuant's 252 BF16 + 26 MXFP8 + 124 NVFP4 mix
 (all decisions driven by measured `0.5·H·MSE_W`) is *strictly better*
 on 8 out of 9 zero-shot metrics and tied on the ninth. The
 sensitivity-driven allocator is doing measurable work beyond what
@@ -182,49 +182,49 @@ uniform quantization + a curated ignore list produces.
 ### Why RedHat has more BF16 layers but worse accuracy
 
 Worth dwelling on: **RedHat's artifact preserves *more* Linears in
-BF16 than prismaquant does**, yet is simultaneously larger on disk
+BF16 than PrismaQuant does**, yet is simultaneously larger on disk
 *and* lower quality. The RedHat quantization_config's ignore list
 contains **342 entries** — the entire visual encoder (110 Linears),
 all 40 MoE routers, the `linear_attn.*` GatedDeltaNet projections on
 every body layer (~150 entries), every `shared_expert.*`, `lm_head`,
-MTP head. prismaquant's artifact keeps only **252 Linears** in BF16 —
+MTP head. PrismaQuant's artifact keeps only **252 Linears** in BF16 —
 90 fewer.
 
 |  | BF16 Linears | MXFP8 | NVFP4 (dense) | NVFP4 (per-expert MoE) | Disk |
 |---|---:|---:|---:|---:|---:|
 | RedHat NVFP4        | **342** | 0  | 0   | ~20.5 k (via one regex) | 24 GB |
-| prismaquant 4.75 bpp | **252** | 26 | 44  | ~20.5 k                 | **22 GB** |
+| PrismaQuant 4.75 bpp | **252** | 26 | 44  | ~20.5 k                 | **22 GB** |
 
 The apparent paradox — RedHat has *more* BF16 yet *larger* disk and
 *lower* accuracy — is exactly the over-preservation failure mode the
 Motivation section warned about. RedHat's quantizer can't measure
 sensitivity, so it hedges: "leave everything that might be sensitive
 in BF16." The 90-Linear gap between 342 and 252 is Linears RedHat
-conservatively preserved but prismaquant's `0.5·H·MSE_W` measurements
+conservatively preserved but PrismaQuant's `0.5·H·MSE_W` measurements
 showed were safe to drop to MXFP8 or NVFP4. That's where the 2 GB
 disk savings come from.
 
 Crucially, the *other* direction holds too: of the Linears RedHat
-quantized to NVFP4, prismaquant's measurements flagged 26 of them as
+quantized to NVFP4, PrismaQuant's measurements flagged 26 of them as
 too sensitive for NVFP4 and promoted them to MXFP8 (and 252 of what
 RedHat quantized... wait, those are already in RedHat's BF16 list).
 The interesting case is really the 26 MXFP8 Linears — these are
 genuinely sensitive ones where NVFP4 would hurt but BF16 is
 overkill. RedHat can't express that distinction with a one-format
-scheme; prismaquant can.
+scheme; PrismaQuant can.
 
 The resulting accuracy pattern matches the theory exactly:
 
 - **arc_easy / arc_challenge** are knowledge-recall tasks that lean
-  heavily on the Linears prismaquant kept in BF16/MXFP8 that RedHat
-  left NVFP4. prismaquant − RedHat ≈ **+3 pp** on both, **2.6σ** on
+  heavily on the Linears PrismaQuant kept in BF16/MXFP8 that RedHat
+  left NVFP4. PrismaQuant − RedHat ≈ **+3 pp** on both, **2.6σ** on
   arc_easy.
 - **hellaswag / piqa** lean on the bulk MoE body, which both
   quants put in NVFP4 identically. Margin narrows to < 1 pp, tied on
   hellaswag-acc.
 - **winogrande** stresses pronoun resolution through attention —
   sensitive to attention-projection quantization. Both quants drop
-  (−2.21 / −4.89), but RedHat drops >2× more because prismaquant's
+  (−2.21 / −4.89), but RedHat drops >2× more because PrismaQuant's
   sensitivity measurements nudged those Linears up to MXFP8/BF16.
 
 Over-preservation burns disk *and* accuracy when you can't
@@ -260,7 +260,7 @@ calls for:
   deltas are real-looking but should be averaged over 2-3 seeds.
 
 Until those land, the defensible claim is the headline above:
-**prismaquant beats uniform NVFP4 on commonsense zero-shot at a
+**PrismaQuant beats uniform NVFP4 on commonsense zero-shot at a
 smaller size**. The reasoning-heavy and generative-quality story is
 still pending.
 
@@ -279,7 +279,7 @@ works out to `4 + 8/16 = 4.5 bits/param` for weights — not the
 nominal 4.0 bits. A "pure NVFP4" model on disk is already at 4.5 bpp;
 you don't save anything by restricting yourself to one format.
 
-prismaquant's 4.75 bpp target is only **+0.25 bpp over pure NVFP4** —
+PrismaQuant's 4.75 bpp target is only **+0.25 bpp over pure NVFP4** —
 roughly a 6% bit-budget increase, allocated intelligently rather than
 uniformly.
 
@@ -310,7 +310,7 @@ The curve is extremely steep near pure-NVFP4 and flattens out past
 The Kneedle knee-detection the allocator suggests (Satopaa et al. 2011)
 lands right around 5.0 bpp. 4.75 sits below the knee — it's on the
 aggressive side of the curve, which is exactly what makes the result
-interesting: **prismaquant at 4.75 bpp outperforms stock NVFP4 at
+interesting: **PrismaQuant at 4.75 bpp outperforms stock NVFP4 at
 a similar or larger effective size**, because the allocator pulls the
 quarter-bit from the least-sensitive 90% of the model and concentrates
 it on the most-sensitive 10%.
@@ -354,23 +354,9 @@ export TARGET_BITS=4.75
 ./quantization/prismaquant/run-pipeline.sh
 ```
 
-That runs probe → cost → allocator → native export.  Extend the probe
-to cover MTP heads:
-
-```bash
-python -m quantization.prismaquant.mtp_probe \
-  --model $MODEL_PATH --nsamples 4 --seqlen 256 \
-  --activation-cache-dir $WORK_DIR/act_mtp \
-  --output $WORK_DIR/artifacts/mtp_probe.pkl
-
-python -m quantization.prismaquant.mtp_cost \
-  --model $MODEL_PATH \
-  --activation-cache-dir $WORK_DIR/act_mtp \
-  --output $WORK_DIR/artifacts/mtp_cost.pkl
-```
-
-Merge the MTP probe / cost into the body artifacts (see
-`run-pipeline.sh`), re-run the allocator and exporter, then serve:
+That runs probe → cost → allocator → native export. MTP heads are
+covered automatically by the incremental probe / cost as a built-in
+shard; no separate commands are needed. Serve with:
 
 ```bash
 vllm serve $WORK_DIR/exported \
@@ -477,18 +463,20 @@ Outputs:
   or corrected on the current model. Emits per-format `gain` factors
   that the allocator re-reads via `--calibration`.
 
-#### 7. MTP extensions — `mtp_probe.py`, `mtp_cost.py`
+#### 7. MTP extensions — built into the incremental probe + cost
 
 Transformers v5 drops `mtp.*` weights on load (they're in the class's
 `_keys_to_ignore_on_load_unexpected`) because MTP is a vLLM-only
-feature. prismaquant instantiates a standalone `MtpModule` (HF
-`Qwen3_5MoeDecoderLayer` plus the `pre_fc_norm_*`, `fc`, and `norm`
-exactly per vLLM's `Qwen3_5MultiTokenPredictor` forward), loads the
-MTP weights directly from safetensors, then runs the standard Fisher
-probe against the MTP auxiliary objective
+feature. PrismaQuant instantiates a standalone `MtpModule`
+(`mtp_module.py`: HF `Qwen3_5MoeDecoderLayer` plus the `pre_fc_norm_*`,
+`fc`, and `norm` exactly per vLLM's `Qwen3_5MultiTokenPredictor`
+forward), loads the MTP weights directly from safetensors, then runs
+the standard Fisher probe against the MTP auxiliary objective
 
     loss = CE( lm_head( MTP(embed_{t+1}, body_hidden_t) ), ids_{t+2} )
 
+This happens inline in `incremental_probe.py` / `incremental_measure_quant_cost.py`
+as a built-in shard kind (on by default, toggle with `--no-include-mtp`).
 The allocator treats MTP Linears identically to body Linears — same
 cost model, same knapsack, same fused-sibling rules. At export time,
 MTP per-expert tensors are split and emitted with `mtp.layers.X.mlp.experts.Y.{gate|up|down}_proj.*`
@@ -625,7 +613,7 @@ is a sharper estimator than inferring it from activation propagation.
 ### What about inter-layer interactions?
 
 The frontier builder remains additive because that is the only
-practical way to sweep the whole model cheaply. prismaquant addresses
+practical way to sweep the whole model cheaply. PrismaQuant addresses
 the missing cross-layer terms by:
 
 - measuring sparse pairwise interactions only for the most important
@@ -676,7 +664,7 @@ preprint; not a production blocker.
 assumes every Linear's quantization error is uncorrelated with
 every other's. False in general — K-FAC style off-diagonals would
 capture it, but they destroy the knapsack's optimal substructure
-(the problem becomes NP-hard Quadratic Knapsack). prismaquant's
+(the problem becomes NP-hard Quadratic Knapsack). PrismaQuant's
 existing `measure_interactions.py` + `quadratic_refine_allocator.py`
 handles this the pragmatic way: measure sparse pairwise interactions
 only for the most-sensitive units near the knee, then refine
@@ -706,7 +694,7 @@ host.
 
 ## Adding a new architecture
 
-prismaquant's pipeline is **model-agnostic by default**, with
+PrismaQuant's pipeline is **model-agnostic by default**, with
 architecture-specific knowledge concentrated in a `ModelProfile`
 subclass. Most of what a profile needs is already encoded by vLLM on
 its model class and **auto-derived** — a new architecture's profile
@@ -715,7 +703,7 @@ MTP-probe helper.
 
 ### The concentration principle
 
-Every place prismaquant needs to make an architecture-specific
+Every place PrismaQuant needs to make an architecture-specific
 decision — fused-sibling promotion, vLLM's weight-loader naming
 convention, packed-expert parameter names, MTP module construction,
 source passthrough prefixes — is routed through `ModelProfile`.
@@ -736,12 +724,12 @@ the vLLM model class registered for this architecture:
 - **`hf_to_vllm_mapper.orig_to_new_prefix`** (e.g.
   `{'model.language_model.': 'language_model.model.', 'model.visual.': 'visual.', 'lm_head.': 'language_model.lm_head.'}`).
   Drives `profile.to_vllm_internal_name()` — the config_groups targets
-  and vLLM's scheme-dispatch names stay in sync without prismaquant
+  and vLLM's scheme-dispatch names stay in sync without PrismaQuant
   duplicating the mapping.
 
 Both are **vLLM's source of truth**. When vLLM adds a new fused
-pattern or naming quirk on an existing architecture, prismaquant picks
-it up on the next probe run with no prismaquant-side code change.
+pattern or naming quirk on an existing architecture, PrismaQuant picks
+it up on the next probe run with no PrismaQuant-side code change.
 
 ### What the profile still writes by hand
 
@@ -750,7 +738,7 @@ it up on the next probe run with no prismaquant-side code change.
 - **`vllm_architecture_class()`** — one string: the HF
   `architectures[0]` entry whose vLLM class carries the metadata above.
 - **`build_mtp_module(text_config)`** (only if the arch has MTP) — an
-  HF-module replica of vLLM's MTP forward so prismaquant's Fisher probe
+  HF-module replica of vLLM's MTP forward so PrismaQuant's Fisher probe
   can backward through it. vLLM's MTP class isn't HF-autograd-friendly,
   which is why this one piece can't auto-derive.
 - **`source_passthrough_prefixes()`** (optional) — which top-level
@@ -833,7 +821,7 @@ instantiation. Passing checks don't guarantee the export will work
 end-to-end, but they catch every class of consistency bug I've
 found so far across three architecture families.
 
-4. **Run the pipeline.** No other file in prismaquant knows which
+4. **Run the pipeline.** No other file in PrismaQuant knows which
 architecture you're on. The probe, cost, allocator, and export all
 pull from the profile when they need an arch-specific decision.
 
@@ -883,7 +871,7 @@ Immediate priorities (next few weeks):
 
 - **MiniMax M2.7 on a single DGX Spark.** MiniMax M2.7 is ~280 B
   parameters — it does not fit in 128 GB at BF16, at FP8, or at a
-  uniform 4-bit quant with meaningful KV headroom. prismaquant's
+  uniform 4-bit quant with meaningful KV headroom. PrismaQuant's
   mixed-format allocator gets close: if we can land an average
   ~3.4 bpp recipe with the sensitive paths in NVFP4 and most experts
   in 3-bit, the model fits and the KV cache has room to breathe. The
@@ -935,7 +923,7 @@ Broader research directions:
 - **Model-profile registry completion** — the `model_profiles/`
   package is in place and handles Qwen3.5/3.6 end-to-end; add
   first-class profiles for DeepSeek-V3 / V3.1, GLM-4, MiniMax, and
-  Llama-family MoE so prismaquant works out of the box on those
+  Llama-family MoE so PrismaQuant works out of the box on those
   architectures.
 - **Sparse-outlier co-quantization.** Borrow from SpQR / SqueezeLLM:
   extract the top-k outlier weights per Linear, serve them as a
@@ -953,7 +941,7 @@ Broader research directions:
 
 ## References
 
-prismaquant stands on the shoulders of a decade of mixed-precision
+PrismaQuant stands on the shoulders of a decade of mixed-precision
 quantization research. The closed-form cost model, the Fisher-diagonal
 sensitivity estimator, the multi-choice knapsack formulation, and the
 format registry are all assembled from published ideas. Key influences:
@@ -1073,17 +1061,17 @@ format registry are all assembled from published ideas. Key influences:
 
 ## Citation
 
-If you use prismaquant in research, please cite this repository. A
+If you use PrismaQuant in research, please cite this repository. A
 preprint covering the closed-form allocator math, the
 `_GradNormCapture` MoE Fisher estimator, and the MTP quantization path
 is forthcoming.
 
 ```bibtex
-@software{prismquant2026,
-  title        = {prismaquant: Mixed-Precision Quantization via
+@software{prismaquant2026,
+  title        = {PrismaQuant: Mixed-Precision Quantization via
                   Fisher-Weighted Bit Allocation},
   author       = {Tand, Rob and contributors},
   year         = {2026},
-  url          = {https://github.com/RobTand/prismaquant},
+  url          = {https://github.com/RobTand/PrismaQuant},
 }
 ```

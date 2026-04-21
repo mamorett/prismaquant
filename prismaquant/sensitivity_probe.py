@@ -1,0 +1,1733 @@
+#!/usr/bin/env python3
+"""sensitivity_probe.py — per-Linear empirical Fisher diagonal trace.
+
+What this measures
+------------------
+For each tracked Linear with weight W, this script estimates the
+per-token empirical Fisher diagonal trace
+
+    H_trace = Σ_w E_token[(∂L/∂W_w)²]
+
+where L is the per-token negative log-likelihood (same loss a language
+model is trained against) and the expectation is over a calibration
+corpus. This quantity is used by allocator.py as the sensitivity score
+in the closed-form predicted Δloss
+
+    Δloss ≈ 0.5 · H_trace · MSE_W                           (eq. 3 in
+                                                             allocator.py)
+
+Naming. The literature uses several names for E[(∂L/∂W)²]: "empirical
+Fisher", "Gauss-Newton diagonal", "gradient-squared". This is NOT the
+true Hessian diagonal — for that you would need a vHv-style probe
+(Hutchinson). The empirical Fisher equals the Hessian only at a true
+loss minimum, which a calibration corpus does not in general satisfy.
+For ranking layers and predicting first-order quantization sensitivity,
+empirical Fisher is the standard HAWQ-V1 choice and works well.
+
+How the per-token estimator stays unbiased
+------------------------------------------
+HuggingFace's `out.loss` is `mean(CE)` over the T tokens in a batch, so
+its gradient is `(1/T) · Σ_t ∂CE_t/∂W`. Squaring that under-estimates
+per-token Fisher by a factor of T (under the standard assumption of
+independent per-token gradients). To avoid that, we reconstruct CE with
+`reduction="sum"` for the backward pass; the gradient then aggregates
+per-token gradients without the 1/T factor, and dividing the
+accumulated `||grad_W||²_F` by total tokens recovers the per-token
+Fisher trace estimator directly.
+
+Other features:
+  - route-aware MoE scaling (discover routers by walking module tree;
+    divide each expert's H_trace by observed routing probability so
+    sparse experts' Fisher is comparable to dense layers')
+  - per-token importance weighting (harder tokens count more); this
+    reweights the loss but preserves the per-token-Fisher units when
+    used with sum reduction
+  - activation snapshot cache for measure_quant_cost.py
+
+Memory:
+  - params requires_grad_(False)   → no gradient tensor storage
+  - gradient checkpointing on      → activations are recomputed during backward
+  - backward hooks reduce grad_w to a scalar inline and drop it
+Result: peak ≈ model weights + one-block activation, fits in 128 GB for 35 B.
+
+Model-agnostic:
+  - Router discovered via module walk (any Linear whose out_features equals a
+    sibling ModuleList named experts, gates, etc.)
+  - Top-k read from model.config (num_experts_per_tok)
+  - Dense models just skip RouterTracker
+"""
+from __future__ import annotations
+
+import json
+import pickle
+import random
+import re
+import time
+from collections import defaultdict
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# Text-only staging
+# ---------------------------------------------------------------------------
+def stage_text_only(model_path: str) -> str:
+    src = Path(model_path)
+    cfg_path = src / "config.json"
+    if not cfg_path.exists():
+        return str(src)
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    if not any(k in cfg for k in
+               ("vision_config", "text_config", "audio_config", "speech_config")):
+        return str(src)
+
+    # Profile-driven: ask the registered ModelProfile which config keys
+    # to strip and whether to promote `text_config.model_type`.
+    try:
+        from .model_profiles import detect_profile
+        profile = detect_profile(str(src))
+    except Exception:
+        profile = None
+    strip_keys = (list(profile.stage_text_only_strip_keys())
+                  if profile is not None
+                  else ["vision_config", "audio_config", "speech_config",
+                        "image_token_id", "video_token_id",
+                        "vision_start_token_id", "vision_end_token_id"])
+    promote_inner_mt = (profile.stage_text_only_promote_inner_model_type()
+                        if profile is not None else False)
+
+    import tempfile
+    for k in strip_keys:
+        cfg.pop(k, None)
+    if "text_config" in cfg:
+        tc = cfg.pop("text_config")
+        for k, v in tc.items():
+            if k == "model_type":
+                # Some families (Gemma 4) want the inner model_type
+                # (e.g. gemma4_text) to take over so AutoConfig
+                # resolves to the text-specific config class. Others
+                # (Qwen 3.5 MoE) want the outer model_type to stay
+                # because the ForCausalLM class is annotated with the
+                # multimodal-umbrella config. Profile decides.
+                if promote_inner_mt:
+                    cfg[k] = v
+                continue
+            # text_config OVERRIDES top-level for the text-only staged
+            # model. Multimodal models (Gemma 4, some Qwen variants)
+            # carry their multimodal-combined hidden_size / num_layers /
+            # head_dim at the top level and the text-specific values in
+            # text_config. Loading weights needs the text_config values
+            # since that's what the text checkpoint tensors were trained
+            # with. If we didn't override, the loader sees mismatched
+            # shapes ([2304] top-level vs [2816] actual weights) and
+            # either raises or silently zero-inits the mismatched params.
+            cfg[k] = v
+    archs = cfg.get("architectures", [])
+    if archs:
+        cfg["architectures"] = [
+            a.replace("ForConditionalGeneration", "ForCausalLM") for a in archs
+        ]
+
+    staged = Path(tempfile.mkdtemp(prefix="prismaquant_stage_"))
+    skip = {"config.json", "preprocessor_config.json",
+            "video_preprocessor_config.json", "processor_config.json"}
+    for p in src.iterdir():
+        if p.name in skip:
+            continue
+        (staged / p.name).symlink_to(p.resolve())
+    with open(staged / "config.json", "w") as f:
+        json.dump(cfg, f, indent=2)
+    return str(staged)
+
+
+# ---------------------------------------------------------------------------
+# Multimodal staging — Phase 2 visual calibration (mirror of stage_text_only)
+# ---------------------------------------------------------------------------
+def stage_multimodal(model_path: str) -> str:
+    """Stage a multimodal model PRESERVING `vision_config` (and `audio_config`
+    where present). This is the mirror of `stage_text_only`, used by the
+    Phase 2 visual Fisher probe path: AutoModelForCausalLM.from_pretrained
+    must see the complete multimodal config so the visual tower actually
+    materializes; AutoProcessor must see the preprocessor_config shard
+    to tokenize image+text pairs.
+
+    Unlike `stage_text_only` we don't strip multimodal keys, don't promote
+    `text_config.model_type`, and don't rewrite architectures. We symlink
+    every source file (including preprocessor_config.json,
+    video_preprocessor_config.json, processor_config.json) into the
+    staged dir verbatim.
+
+    When the source has no multimodal config keys, this is effectively a
+    no-op and we return the source path unchanged — matching
+    `stage_text_only`'s fast path.
+    """
+    src = Path(model_path)
+    cfg_path = src / "config.json"
+    if not cfg_path.exists():
+        return str(src)
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    # If this checkpoint has no multimodal bits, nothing to do — return
+    # the source directly so the caller doesn't pay for a symlink tree
+    # on pure-text checkpoints.
+    if not any(k in cfg for k in ("vision_config", "audio_config",
+                                  "speech_config")):
+        return str(src)
+
+    import tempfile
+    staged = Path(tempfile.mkdtemp(prefix="prismaquant_mm_stage_"))
+    for p in src.iterdir():
+        if p.name == "config.json":
+            continue
+        (staged / p.name).symlink_to(p.resolve())
+    # Write the source config through verbatim. We intentionally do NOT
+    # strip vision_config/audio_config, do NOT rewrite architectures,
+    # and do NOT promote text_config.model_type — the multimodal loader
+    # needs the full config as-is.
+    with open(staged / "config.json", "w") as f:
+        json.dump(cfg, f, indent=2)
+    return str(staged)
+
+
+# ---------------------------------------------------------------------------
+# Multimodal calibration loader — Phase 2 visual Fisher
+# ---------------------------------------------------------------------------
+def _synthetic_multimodal_calibration_samples(
+    processor, n_samples: int, max_text_len: int,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Offline synthetic fallback: n small PIL images + short captions
+    fed through the processor. Exercises the visual Fisher path without
+    needing network access. Real COCO/HF datasets replace this when
+    `--mm-dataset` is a HuggingFace id.
+
+    Each sample is a 224x224 RGB image with a deterministic flat color
+    (enough to make patch-embed + attention gradients non-trivial) and
+    a short caption matched to its index.
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        return []
+    captions = [
+        "a red apple on a wooden table",
+        "a blue sky with scattered clouds",
+        "a cat sleeping on a patterned rug",
+        "a yellow sunflower in a green field",
+        "a coffee mug next to an open book",
+        "a golden retriever chasing a frisbee",
+        "a mountain lake reflecting tall peaks",
+        "a busy city street at night",
+    ]
+    out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    for i in range(n_samples):
+        size = 224
+        img = Image.new("RGB", (size, size),
+                        color=(30 + (i * 37) % 220,
+                               40 + (i * 53) % 200,
+                               50 + (i * 67) % 180))
+        caption = captions[i % len(captions)]
+        prompt = f"<|image|>Describe: {caption}"
+        # Processor may be None (e.g. tests without a real processor) —
+        # in that case we build the triple directly as a rank-4 pixel
+        # tensor + a random integer id sequence. This keeps the
+        # calibration shape + dtype contract intact for unit tests.
+        if processor is None:
+            import torch as _t
+            pixel_values = _t.rand(1, 3, size, size, dtype=_t.float32)
+            # Tiny fake id sequence (ids in [1, 100] so both labels and
+            # vocab-index masking behave sensibly even without a real
+            # tokenizer).
+            input_ids = _t.randint(1, 100, (1, min(max_text_len, 16)),
+                                   dtype=_t.long)
+            out.append((pixel_values, input_ids, input_ids.clone()))
+            continue
+        enc = None
+        try:
+            enc = processor(text=prompt, images=img, return_tensors="pt")
+        except Exception:
+            # Some processors need chat-template messages. Try that shape.
+            try:
+                messages = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img},
+                        {"type": "text", "text": f"Describe: {caption}"},
+                    ],
+                }]
+                enc = processor.apply_chat_template(
+                    messages, add_generation_prompt=False,
+                    tokenize=True, return_dict=True, return_tensors="pt")
+            except Exception:
+                continue
+        if enc is None:
+            continue
+        pixel_values = enc.get("pixel_values")
+        input_ids = enc.get("input_ids")
+        if pixel_values is None or input_ids is None:
+            continue
+        if input_ids.size(1) > max_text_len:
+            input_ids = input_ids[:, :max_text_len]
+        out.append((pixel_values, input_ids, input_ids.clone()))
+    return out
+
+
+def load_multimodal_calibration(
+    processor,
+    dataset_name: str,
+    n_samples: int,
+    max_text_len: int,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Build a list of (pixel_values, input_ids, labels) triples for
+    multimodal Fisher calibration.
+
+    `processor` is an `AutoProcessor` — usually loaded via
+    `AutoProcessor.from_pretrained(model_path, trust_remote_code=True)`.
+
+    `dataset_name`:
+      - `"synthetic"` (default): built-in offline stub. No network, no
+        HF datasets dependency beyond what transformers itself needs.
+        Used to exercise the visual Fisher code path under unit tests
+        and in environments without dataset access.
+      - any other string: treated as a HuggingFace dataset id. We stream
+        up to `n_samples * 4` rows and filter for rows that have an
+        image (+ a caption/text field). Falls back to the synthetic
+        stub on any load failure (offline, rate-limited, schema
+        mismatch, etc.) so the probe always makes forward progress.
+
+    Labels default to `input_ids.clone()` (teacher-forced CE on the
+    joint image+text sequence). Processors that emit `-100` sentinel
+    ids for masked positions are handled by the probe's CE backward —
+    not by this loader.
+    """
+    triples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    if dataset_name == "synthetic":
+        return _synthetic_multimodal_calibration_samples(
+            processor, n_samples, max_text_len)
+    try:
+        from datasets import load_dataset
+        ds = load_dataset(dataset_name, split="train", streaming=True)
+        iterator = iter(ds)
+        for _ in range(n_samples * 4):
+            try:
+                row = next(iterator)
+            except StopIteration:
+                break
+            img = row.get("image")
+            caption = (row.get("caption")
+                       or row.get("sentences", [{}])[0].get("raw")
+                       or row.get("text")
+                       or "describe this image")
+            if img is None:
+                continue
+            prompt = f"<|image|>Describe: {caption}"
+            try:
+                enc = processor(text=prompt, images=img, return_tensors="pt")
+            except Exception:
+                continue
+            pixel_values = enc.get("pixel_values")
+            input_ids = enc.get("input_ids")
+            if pixel_values is None or input_ids is None:
+                continue
+            if input_ids.size(1) > max_text_len:
+                input_ids = input_ids[:, :max_text_len]
+            triples.append((pixel_values, input_ids, input_ids.clone()))
+            if len(triples) >= n_samples:
+                break
+    except Exception as e:
+        print(f"[probe/mm] dataset {dataset_name!r} unreachable ({e}); "
+              f"falling back to synthetic stub", flush=True)
+    if len(triples) < n_samples:
+        synth = _synthetic_multimodal_calibration_samples(
+            processor, n_samples - len(triples), max_text_len)
+        triples.extend(synth)
+    return triples[:n_samples]
+
+
+class _GradNormCapture(torch.autograd.Function):
+    """Identity in forward; in backward, accumulates packed-expert Fisher
+    statistics at up to three granularities and returns None for the
+    weight gradient — which tells autograd to NOT accumulate to the leaf
+    parameter's .grad.
+
+    Three accumulators, all optional:
+      - `scalar_accumulator`: scalar Frobenius-norm of per-weight grad^2
+        (the classic `h_trace`). Always cheap. ~1 float per packed param.
+      - `channel_accumulator`: per-expert per-output-channel diagonal
+        [E, M] — the `sum over in-features of grad^2`. ~1 MB per packed
+        param at 256 experts × 1024 out rows.
+      - `full_accumulator`: full per-weight Fisher [E, M, N] accumulated
+        in fp32 on CPU. ~5 GB per packed param at 256 experts ×
+        1024 × 1536. Chunked by expert so GPU peak stays ~20 MB per
+        expert rather than materializing the whole squared tensor at
+        once. Enables full per-weight predicted-dloss at inference-
+        model-export time: the extra cost is one-time and well worth
+        the fidelity for models that will be served many times.
+
+    Why return None? With 40 MoE layers × 2 packed params × ~5 GB of
+    bf16 grads = 400 GB if .grad were retained per leaf. By returning
+    None we tell autograd "this input doesn't need a stored gradient";
+    .grad stays None on the leaf and only the transient grad_output
+    (one per backward node, freed in topological order) is alive at
+    any one time.
+    """
+
+    @staticmethod
+    def forward(ctx, weight, name, scalar_accumulator, channel_accumulator,
+                full_accumulator):
+        ctx.name = name
+        ctx.scalar_acc = scalar_accumulator
+        ctx.channel_acc = channel_accumulator
+        ctx.full_acc = full_accumulator
+        return weight
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if grad_output is None:
+            return None, None, None, None, None
+        g = grad_output.detach()
+        # Scalar Frobenius-norm squared — streamed to avoid materializing
+        # the full squared tensor for very large packed params.
+        flat = g.reshape(-1)
+        chunk = 1_000_000
+        total = 0.0
+        for i in range(0, flat.numel(), chunk):
+            total += float(flat[i:i + chunk].float().pow(2).sum().item())
+        ctx.scalar_acc[ctx.name] = ctx.scalar_acc.get(ctx.name, 0.0) + total
+        # Per-expert per-output-channel diagonal: reduce along the
+        # in-feature axis (the last dim). For a [E, M, N] packed param,
+        # result is [E, M]. Accumulated across backward samples.
+        if ctx.channel_acc is not None:
+            if g.dim() == 3:
+                per_ch = g.float().pow(2).sum(dim=-1)      # [E, M]
+            elif g.dim() == 2:
+                per_ch = g.float().pow(2).sum(dim=-1, keepdim=False)
+            else:
+                per_ch = None
+            if per_ch is not None:
+                cur = ctx.channel_acc.get(ctx.name)
+                if cur is None:
+                    ctx.channel_acc[ctx.name] = per_ch.cpu()
+                else:
+                    cur.add_(per_ch.cpu())
+        # Full per-weight Fisher: chunk along the expert dim so CPU peak
+        # stays bounded even on 128-256 expert packed params. Upcast +
+        # square happen on CPU per-chunk (bf16 transfer is cheaper than
+        # fp32 transfer, and the transient fp32 lives for exactly one
+        # chunk before being added into the persistent accumulator).
+        # Chunk size 16 gives ~1-2 GB CPU transient at 3000-column width
+        # — scales cleanly to 256+ experts at 397B+ without retuning.
+        if ctx.full_acc is not None and g.dim() >= 2:
+            name = ctx.name
+            cur = ctx.full_acc.get(name)
+            if cur is None:
+                cur = torch.zeros(*g.shape, dtype=torch.float32,
+                                  device="cpu")
+                ctx.full_acc[name] = cur
+            if g.dim() == 3:
+                E = g.size(0)
+                chunk_e = max(1, min(16, E))
+                for e in range(0, E, chunk_e):
+                    g_c = g[e:e + chunk_e].cpu()
+                    cur[e:e + chunk_e].add_(g_c.float().pow(2))
+                    del g_c
+            else:
+                g_c = g.cpu()
+                cur.add_(g_c.float().pow(2))
+                del g_c
+        return None, None, None, None, None
+
+
+_PACKED_EXPERT_PARAM_NAMES = {
+    "gate_up_proj", "down_proj",            # Qwen3.5 / 3.6 packed MoE
+    "w1", "w2", "w3",                       # Mixtral-style legacy
+    "gate_proj", "up_proj",                 # Some HF layouts
+}
+
+
+def _is_packed_experts_module(module: nn.Module) -> bool:
+    """A module qualifies as a packed-experts container iff (a) its
+    class name contains "Experts" (case-insensitive), and (b) it owns
+    at least one 3D nn.Parameter whose attribute name is in
+    `_PACKED_EXPERT_PARAM_NAMES`.
+
+    The class-name check excludes other modules that happen to own 3D
+    parameters — most importantly Conv1d in linear-attention paths,
+    whose `weight` is shape `[out, in, kernel]`. The param-name check
+    is a second safety net against unusual modules with unrelated 3D
+    state.
+    """
+    cls_name = type(module).__name__.lower()
+    if "expert" not in cls_name:
+        return False
+    for n, p in module.named_parameters(recurse=False):
+        if (isinstance(p, nn.Parameter)
+                and p.dim() == 3
+                and n in _PACKED_EXPERT_PARAM_NAMES):
+            return True
+    return False
+
+
+def _packed_experts_param_names(module: nn.Module) -> list[str]:
+    """Return the attribute names of all 3D packed parameters on
+    `module`, restricted to the known MoE expert names. Order is stable
+    across Python runs."""
+    names = []
+    for n, p in module.named_parameters(recurse=False):
+        if (isinstance(p, nn.Parameter)
+                and p.dim() == 3
+                and n in _PACKED_EXPERT_PARAM_NAMES):
+            names.append(n)
+    return sorted(names)
+
+
+_PRISMAQUANT_PATCH_SENTINEL = "_prismaquant_packed_expert_patch"
+_PRISMAQUANT_CHANNEL_SENTINEL = "_prismaquant_packed_expert_channel_patch"
+_PRISMAQUANT_FULL_SENTINEL = "_prismaquant_packed_expert_full_patch"
+
+
+def install_packed_expert_hooks(
+    model: nn.Module,
+    accumulator: dict,
+    channel_accumulator: dict | None = None,
+    full_accumulator: dict | None = None,
+) -> dict[str, dict]:
+    """Patch every packed-experts module's forward so its 3D parameters
+    route through `_GradNormCapture` before each use.
+
+    `accumulator` collects the scalar Frobenius-norm squared (matches
+    the nn.Linear `h_trace_raw`). `channel_accumulator` collects the
+    per-expert per-output-channel diagonal as [E, M] CPU tensors (for
+    the full per-weight Fisher cost model). The channel accumulator is
+    optional for backward compatibility; when None, packed experts
+    contribute only their scalar trace and the allocator falls back to
+    the scalar proxy for those entries.
+
+    Returns a metadata dict keyed by `<module_qname>.<param_name>` with
+    the same shape/role information stored for nn.Linear modules in
+    `FisherAccumulator`. The probe inserts these into its main `stats`
+    dict so the allocator can treat them uniformly.
+
+    Idempotent across calls. If a module has already been patched (by
+    a prior call within the same Python process), we re-bind both the
+    scalar and channel accumulator references to the new dicts rather
+    than wrapping the patch again. This is essential for the incremental
+    probe path, which constructs a fresh FisherAccumulator per shard
+    against a single loaded model.
+
+    Activation snapshotting for measure_quant_cost is handled by
+    `FisherAccumulator` directly (forward hook on the experts module).
+    """
+    meta: dict[str, dict] = {}
+    for qname, module in model.named_modules():
+        if not _is_packed_experts_module(module):
+            continue
+        param_names = _packed_experts_param_names(module)
+        if not param_names:
+            continue
+
+        # Idempotent re-bind path. The sentinel holds a reference to the
+        # mutable accumulator dict that patched_forward writes to. We
+        # rebind it (clear contents and adopt the new dict's identity by
+        # swapping references) — but the simpler primitive is to update
+        # the closure's *target dict identity* via attribute, since
+        # patched_forward's closure already binds the original dict by
+        # reference. Easiest: store the live accumulator on the module
+        # and have patched_forward read it indirectly each call.
+        if hasattr(module, _PRISMAQUANT_PATCH_SENTINEL):
+            # Update the live accumulator binding for this module's patch.
+            setattr(module, _PRISMAQUANT_PATCH_SENTINEL, accumulator)
+            setattr(module, _PRISMAQUANT_CHANNEL_SENTINEL, channel_accumulator)
+            setattr(module, _PRISMAQUANT_FULL_SENTINEL, full_accumulator)
+            # Still report metadata so callers can refresh their stats dict.
+            for pn in param_names:
+                p_existing = module._parameters.get(pn)
+                if p_existing is None:
+                    continue
+                shape = tuple(p_existing.shape)
+                full_name = f"{qname}.{pn}" if qname else pn
+                if p_existing.is_meta:
+                    w_max_abs = None
+                    w_norm_sq = None
+                else:
+                    w_max_abs = float(p_existing.detach().abs().max().item())
+                    w_norm_sq = float(p_existing.detach().pow(2).sum().item())
+                meta[full_name] = {
+                    "h_trace_raw": 0.0,
+                    "h_w2_sum_raw": 0.0,
+                    "w_max_abs": w_max_abs,
+                    "w_norm_sq": w_norm_sq,
+                    "n_params": int(p_existing.numel()),
+                    "in_features": int(shape[2]),
+                    "out_features": int(shape[1]),
+                    "num_experts": int(shape[0]),
+                    "n_tokens_seen": 0,
+                    "route_prob": None,
+                    "router_path": None,
+                    "expert_id": None,
+                    "_packed_experts_module": qname,
+                    "_packed_param": pn,
+                }
+            continue
+
+        # Enable grad on packed params so autograd computes their gradient
+        # through our identity wrapper.
+        for pn in param_names:
+            getattr(module, pn).requires_grad_(True)
+
+        for pn in param_names:
+            p: nn.Parameter = getattr(module, pn)
+            full_name = f"{qname}.{pn}" if qname else pn
+            shape = tuple(p.shape)
+            # Convention: shape[0] = num_experts; the per-expert matrix is
+            # the trailing two dims. Use (out_features, in_features) =
+            # (shape[1], shape[2]) to match nn.Linear's convention; the
+            # allocator's predicted_dloss only needs n_params correct.
+            num_experts = int(shape[0])
+            out_features = int(shape[1])
+            in_features = int(shape[2])
+            n_params = int(p.numel())
+            # When the model is loaded with accelerate's disk offload
+            # (`device_map="auto"` on hardware too small to fit the full
+            # model), packed params start out on the meta device and are
+            # materialized lazily at forward time. Defer the max-abs /
+            # norm-sq scalar statistics until they can be measured.
+            if p.is_meta:
+                w_max_abs = None
+                w_norm_sq = None
+            else:
+                w_max_abs = float(p.detach().abs().max().item())
+                w_norm_sq = float(p.detach().pow(2).sum().item())
+            meta[full_name] = {
+                "h_trace_raw": 0.0,
+                "h_w2_sum_raw": 0.0,  # not measured for packed; kept for schema
+                "w_max_abs": w_max_abs,
+                "w_norm_sq": w_norm_sq,
+                "n_params": n_params,
+                "in_features": in_features,
+                "out_features": out_features,
+                "num_experts": num_experts,
+                "n_tokens_seen": 0,
+                "route_prob": None,  # rolled into per-expert sensitivity by sum
+                "router_path": None,
+                "expert_id": None,
+                "_packed_experts_module": qname,
+                "_packed_param": pn,
+            }
+
+        # Patch forward to wrap each packed param with _GradNormCapture.
+        # The original forward uses self.<pn>; we shadow those attributes
+        # with the wrapped tensors for the duration of the call. nn.Module
+        # __getattribute__ checks _parameters before __dict__, so we have
+        # to temporarily move the param out of _parameters and shadow via
+        # __dict__ to make the wrapped tensor visible to the original
+        # forward.
+        original_forward = module.forward
+        ns = list(param_names)
+        full_names = [f"{qname}.{pn}" if qname else pn for pn in ns]
+        mod_ref = module
+
+        # Store the live accumulators as attributes so subsequent calls
+        # to install_packed_expert_hooks can re-bind them (per-shard) by
+        # just updating these attributes. patched_forward reads them
+        # indirectly each invocation via getattr.
+        setattr(mod_ref, _PRISMAQUANT_PATCH_SENTINEL, accumulator)
+        setattr(mod_ref, _PRISMAQUANT_CHANNEL_SENTINEL, channel_accumulator)
+        setattr(mod_ref, _PRISMAQUANT_FULL_SENTINEL, full_accumulator)
+
+        def patched_forward(*args, _ns=ns, _full=full_names, _orig=original_forward,
+                            _mod=mod_ref, **kwargs):
+            acc = getattr(_mod, _PRISMAQUANT_PATCH_SENTINEL, None)
+            ch_acc = getattr(_mod, _PRISMAQUANT_CHANNEL_SENTINEL, None)
+            fu_acc = getattr(_mod, _PRISMAQUANT_FULL_SENTINEL, None)
+            if acc is None:
+                # Should not happen, but degrade gracefully.
+                return _orig(*args, **kwargs)
+            saved_params = {}
+            wrapped = {}
+            for pn, fn in zip(_ns, _full):
+                saved_params[pn] = _mod._parameters.pop(pn)
+                wrapped[pn] = _GradNormCapture.apply(
+                    saved_params[pn], fn, acc, ch_acc, fu_acc)
+                _mod.__dict__[pn] = wrapped[pn]
+            try:
+                return _orig(*args, **kwargs)
+            finally:
+                for pn in _ns:
+                    _mod.__dict__.pop(pn, None)
+                    _mod._parameters[pn] = saved_params[pn]
+
+        module.forward = patched_forward
+
+    return meta
+
+
+def resolve_execution_device(model: nn.Module, requested_device: str) -> torch.device:
+    """Choose the device used for input ids / embeddings during probing.
+
+    When `device_map="auto"` is used for model load, the model can be sharded
+    across CPU and GPU. In that case we want to feed tokens to the device that
+    owns the input embedding weights rather than assuming a single global
+    `cuda`/`cpu` target.
+    """
+    try:
+        emb = model.get_input_embeddings()
+        if emb is not None and hasattr(emb, "weight"):
+            return emb.weight.device
+    except Exception:
+        pass
+    for p in model.parameters():
+        if p.device.type != "meta":
+            return p.device
+    return torch.device(requested_device)
+
+
+# ---------------------------------------------------------------------------
+# Model-agnostic MoE discovery
+# ---------------------------------------------------------------------------
+def discover_moe_structure(model: nn.Module) -> dict[str, tuple[str, str]]:
+    """Return {expert_linear_qname: (router_qname, expert_id_str)}.
+
+    Walk the module tree.  For any module that has a child attribute named
+    `experts` or `block_sparse_moe_experts` that is a ModuleList, find a
+    sibling Linear in the same parent whose out_features equals len(experts).
+    That Linear is the router.
+    """
+    def _router_matches_num_experts(child: nn.Module, num_experts: int) -> bool:
+        if isinstance(child, nn.Linear) and child.out_features == num_experts:
+            return True
+        weight = getattr(child, "weight", None)
+        if isinstance(weight, torch.Tensor) and weight.ndim >= 1:
+            return int(weight.shape[0]) == num_experts
+        return False
+
+    expert_info: dict[str, tuple[str, str]] = {}
+    for parent_qname, parent in model.named_modules():
+        candidates = []
+        for attr in ("experts", "block_sparse_moe_experts",
+                     "moe_experts", "expert_layer"):
+            experts_container = getattr(parent, attr, None)
+            if experts_container is None or not isinstance(experts_container, nn.Module):
+                continue
+            # Two possible layouts:
+            #   A) experts_container IS the list (nn.ModuleList / nn.Sequential /
+            #      AutoRound's SequentialQwen3_5MoeExperts which subclasses ModuleList)
+            #   B) experts_container is a plain nn.Module with numbered children
+            #      (e.g. Qwen3_5MoeExperts after in-place unfuse: children are
+            #      named "0", "1", ..., each holding per-expert Linears).
+            #
+            # Both layouts are detected by looking at child names that are
+            # consecutive integer strings starting from 0.
+            child_dict = dict(experts_container.named_children())
+            numeric_keys = sorted(
+                [k for k in child_dict if k.isdigit()],
+                key=int,
+            )
+            if numeric_keys:
+                # Require the numeric children to be 0..N-1 (no gaps)
+                if [int(k) for k in numeric_keys] != list(range(len(numeric_keys))):
+                    continue
+                if not all(isinstance(child_dict[k], nn.Module) for k in numeric_keys):
+                    continue
+                candidates.append((attr, experts_container, "nested", numeric_keys))
+                continue
+
+            # Linear-loop layout after MoE unfuse: experts container itself
+            # remains a module, but its packed projections become ModuleLists:
+            #   experts.gate_up_proj.<expert_idx>
+            #   experts.down_proj.<expert_idx>
+            projection_lists = {}
+            for proj_name in ("gate_up_proj", "down_proj", "w1", "w2", "w3"):
+                proj = getattr(experts_container, proj_name, None)
+                if proj is None or not isinstance(proj, nn.Module):
+                    continue
+                proj_children = dict(proj.named_children())
+                proj_numeric = sorted([k for k in proj_children if k.isdigit()], key=int)
+                if not proj_numeric:
+                    continue
+                if [int(k) for k in proj_numeric] != list(range(len(proj_numeric))):
+                    continue
+                if not all(isinstance(proj_children[k], nn.Module) for k in proj_numeric):
+                    continue
+                projection_lists[proj_name] = proj_numeric
+            if projection_lists:
+                # Require a consistent expert count across projections.
+                expert_lists = list(projection_lists.values())
+                if all(v == expert_lists[0] for v in expert_lists[1:]):
+                    candidates.append((attr, experts_container, "linear_loop", expert_lists[0]))
+        if not candidates:
+            continue
+        attr_name, experts_container, layout, numeric_keys = candidates[0]
+        num_experts = len(numeric_keys)
+
+        # Find sibling Linear (or any module whose output feature dim
+        # equals num_experts) that acts as the router.
+        router_qname = None
+        for child_name, child in parent.named_children():
+            if child is experts_container:
+                continue
+            if _router_matches_num_experts(child, num_experts):
+                router_qname = (f"{parent_qname}.{child_name}"
+                                if parent_qname else child_name)
+                break
+        if router_qname is None:
+            continue
+
+        experts_root = (f"{parent_qname}.{attr_name}"
+                        if parent_qname else attr_name)
+        if layout == "nested":
+            for eid_str in numeric_keys:
+                expert_mod = child_dict[eid_str]
+                for sub_name, sub_mod in expert_mod.named_modules():
+                    if not isinstance(sub_mod, nn.Linear) or sub_name == "":
+                        continue
+                    leaf = f"{experts_root}.{eid_str}.{sub_name}"
+                    expert_info[leaf] = (router_qname, eid_str)
+        else:
+            for proj_name in ("gate_up_proj", "down_proj", "w1", "w2", "w3"):
+                proj = getattr(experts_container, proj_name, None)
+                if proj is None or not isinstance(proj, nn.Module):
+                    continue
+                proj_children = dict(proj.named_children())
+                for eid_str in numeric_keys:
+                    sub_mod = proj_children.get(eid_str)
+                    if not isinstance(sub_mod, nn.Linear):
+                        continue
+                    leaf = f"{experts_root}.{proj_name}.{eid_str}"
+                    expert_info[leaf] = (router_qname, eid_str)
+
+    return expert_info
+
+
+def read_top_k(model: nn.Module, default: int = 2) -> int:
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        return default
+    for attr in ("num_experts_per_tok", "moe_top_k", "num_active_experts"):
+        v = getattr(cfg, attr, None)
+        if isinstance(v, int) and v > 0:
+            return v
+    text_cfg = getattr(cfg, "text_config", None)
+    if text_cfg is not None:
+        for attr in ("num_experts_per_tok", "moe_top_k"):
+            v = getattr(text_cfg, attr, None)
+            if isinstance(v, int) and v > 0:
+                return v
+    return default
+
+
+# ---------------------------------------------------------------------------
+# Router tracker: per-(router, expert) activation probability
+# ---------------------------------------------------------------------------
+class RouterTracker:
+    def __init__(self, model: nn.Module, routers: list[str], top_k: int):
+        self.top_k = top_k
+        self.counts_t: dict[str, torch.Tensor] = {}
+        self.total_tokens: dict[str, int] = defaultdict(int)
+        self._handles = []
+        for rq in routers:
+            try:
+                mod = model.get_submodule(rq)
+            except AttributeError:
+                continue
+            n_experts = None
+            if isinstance(mod, nn.Linear):
+                n_experts = mod.out_features
+            else:
+                weight = getattr(mod, "weight", None)
+                if isinstance(weight, torch.Tensor) and weight.ndim >= 1:
+                    n_experts = int(weight.shape[0])
+            if not isinstance(n_experts, int) or n_experts <= 0:
+                continue
+            self.counts_t[rq] = torch.zeros(n_experts, dtype=torch.float64)
+            self._handles.append(mod.register_forward_hook(self._make_hook(rq)))
+
+    def _make_hook(self, router_qname: str):
+        def hook(module, inp, out):
+            scores = out if isinstance(out, torch.Tensor) else out[0]
+            flat = scores.detach().reshape(-1, scores.size(-1))
+            k = min(self.top_k, flat.size(-1))
+            topk_v, topk_i = flat.topk(k, dim=-1)
+            probs = F.softmax(topk_v, dim=-1)
+            weighted = torch.bincount(
+                topk_i.reshape(-1),
+                weights=probs.reshape(-1).to(torch.float64),
+                minlength=int(scores.size(-1)),
+            )
+            self.total_tokens[router_qname] += flat.size(0)
+            self.counts_t[router_qname].add_(weighted.cpu())
+        return hook
+
+    def remove_hooks(self):
+        for h in self._handles:
+            h.remove()
+        self._handles.clear()
+
+    def prob(self, router_qname: str, eid: str) -> float:
+        total = self.total_tokens.get(router_qname, 0)
+        if total == 0:
+            return 0.0
+        counts = self.counts_t.get(router_qname)
+        if counts is None:
+            return 0.0
+        idx = int(eid)
+        if idx < 0 or idx >= counts.numel():
+            return 0.0
+        return float(counts[idx].item()) / total
+
+    @property
+    def counts(self) -> dict[str, dict[str, float]]:
+        out: dict[str, dict[str, float]] = {}
+        for router, counts in self.counts_t.items():
+            nz = torch.nonzero(counts > 0, as_tuple=False).reshape(-1)
+            out[router] = {
+                str(int(i)): float(counts[int(i)].item())
+                for i in nz.tolist()
+            }
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Fisher accumulator with activation snapshot cache
+# ---------------------------------------------------------------------------
+class FisherAccumulator:
+    def __init__(self, model: nn.Module, tracked: list[str],
+                 expert_info: dict[str, tuple[str, str]],
+                 act_cache_dir: Path | None = None,
+                 input_rows: int = 256,
+                 hook_packed_experts: bool = True,
+                 h_detail_dir: Path | None = None):
+        self.stats: dict[str, dict] = {}
+        self._saved_inputs: dict[str, torch.Tensor] = {}
+        self._fwd_handles, self._bwd_handles = [], []
+        self.tracked = set(tracked)
+        self.expert_info = expert_info
+        self.cache_dir = act_cache_dir
+        self.h_detail_dir = Path(h_detail_dir) if h_detail_dir else None
+        self.input_rows = input_rows
+        self._input_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
+        self._rows_got: dict[str, int] = defaultdict(int)
+        # Packed expert grad-norm accumulator: written by _GradNormCapture
+        # during backward, read in finalize().
+        self._packed_grad_acc: dict[str, float] = {}
+        # Per-(experts module qname) sample count (one per backward),
+        # populated by the experts forward hook below.
+        self._packed_sample_count: dict[str, int] = defaultdict(int)
+        # Per-experts-module activation snapshots, captured live so
+        # measure_quant_cost can read packed expert inputs.
+        self._packed_act_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
+        self._packed_act_rows: dict[str, int] = defaultdict(int)
+
+        # Per-layer accumulator for full per-weight Fisher diagonal.
+        # Keyed by Linear qname -> CPU fp64 tensor of shape [out, in]
+        # matching the weight shape. Accumulated by the backward hook;
+        # written to `probe_detail/<sanitized_name>.pt` in finalize()
+        # so the probe pickle stays small while downstream consumers
+        # can lazy-load the full H per layer.
+        self._h_full: dict[str, torch.Tensor] = {}
+        # Same idea for packed experts, but reduced to per-expert
+        # per-output-channel: [E, M] instead of [E, M, N]. Full
+        # per-weight for 80 packed tensors at 35B scale is 160+ GB;
+        # per-channel is 160 MB total — still a vector form.
+        self._h_packed_channel: dict[str, torch.Tensor] = {}
+        for name, mod in model.named_modules():
+            if name not in self.tracked or not isinstance(mod, nn.Linear):
+                continue
+            w = mod.weight
+            router_qname, eid = expert_info.get(name, (None, None))
+            # Weights loaded under accelerate disk offload start on the
+            # meta device and materialize lazily during forward. Defer
+            # the scalar weight statistics and the H-full accumulator
+            # allocation until `_make_fwd`/`_make_bwd` sees a real tensor.
+            if w.is_meta:
+                w_max_abs = None
+                w_norm_sq = None
+            else:
+                w_max_abs = float(w.detach().abs().max().item())
+                w_norm_sq = float(w.detach().pow(2).sum().item())
+            self.stats[name] = {
+                "h_trace_raw": 0.0,
+                "h_w2_sum_raw": 0.0,
+                "w_max_abs": w_max_abs,
+                "w_norm_sq": w_norm_sq,
+                "n_params": int(w.numel()),
+                "in_features": mod.in_features,
+                "out_features": mod.out_features,
+                "n_tokens_seen": 0,
+                "route_prob": None,
+                "router_path": router_qname,
+                "expert_id": eid,
+            }
+            if w.is_meta:
+                # Leave the accumulator slot empty; `_make_bwd` will
+                # allocate it the first time a real-device gradient
+                # flows through this Linear.
+                self._h_full[name] = None
+            else:
+                self._h_full[name] = torch.zeros(
+                    mod.out_features, mod.in_features,
+                    dtype=torch.float32, device=w.device,
+                )
+            self._fwd_handles.append(
+                mod.register_forward_hook(self._make_fwd(name)))
+            self._bwd_handles.append(
+                mod.register_full_backward_hook(self._make_bwd(name, mod)))
+
+        if hook_packed_experts:
+            packed_meta = install_packed_expert_hooks(
+                model,
+                accumulator=self._packed_grad_acc,
+                channel_accumulator=self._h_packed_channel,
+            )
+            for full_name, meta in packed_meta.items():
+                # Filter against the tracked set when tracked is a regex
+                # match; here we accept any packed param under a tracked
+                # parent (the regex from run_probe_pass already filters
+                # by layer).
+                experts_qname = meta.pop("_packed_experts_module")
+                meta.pop("_packed_param", None)
+                # Heuristic: include packed entry if any of its conjugate
+                # "in this same parent layer" Linears are tracked. This
+                # makes shard regexes (`model.layers.X.`) work cleanly.
+                parent_layer = ".".join(experts_qname.split(".")[:3])  # e.g. model.layers.7
+                if any(t.startswith(parent_layer + ".") for t in self.tracked):
+                    self.stats[full_name] = meta
+                    # Register a forward hook on the experts module to
+                    # bump the per-backward sample count (used to keep
+                    # n_tokens_seen aligned with the Linear path's
+                    # accounting).
+                    try:
+                        experts_mod = model.get_submodule(experts_qname)
+                    except AttributeError:
+                        continue
+
+                    def _exp_fwd(_mod, inp, _out, _qn=experts_qname,
+                                 _full=full_name, _x_acc=self._packed_act_snaps,
+                                 _r=self._packed_act_rows):
+                        x = inp[0] if isinstance(inp, tuple) else inp
+                        if isinstance(x, torch.Tensor):
+                            self._packed_sample_count[_full] += int(
+                                x.detach().reshape(-1, x.size(-1)).size(0))
+                            if act_cache_dir is not None:
+                                need = self.input_rows - _r[_qn]
+                                if need > 0:
+                                    flat = x.detach().reshape(-1, x.size(-1))
+                                    if flat.size(0) > need:
+                                        idx = torch.randperm(flat.size(0),
+                                                             device=flat.device)[:need]
+                                        flat = flat.index_select(0, idx)
+                                    _x_acc[_qn].append(flat.to("cpu"))
+                                    _r[_qn] += flat.size(0)
+
+                    self._fwd_handles.append(
+                        experts_mod.register_forward_hook(_exp_fwd))
+
+    def _make_fwd(self, name: str):
+        def hook(module, inp, out):
+            x = inp[0] if isinstance(inp, tuple) else inp
+            self._saved_inputs[name] = x.detach()
+            # Fill in deferred weight stats for disk-offloaded Linears
+            # the first time a real tensor becomes available.
+            stats = self.stats.get(name)
+            if stats is not None and stats.get("w_max_abs") is None:
+                w = module.weight
+                if w is not None and not w.is_meta:
+                    wd = w.detach()
+                    stats["w_max_abs"] = float(wd.abs().max().item())
+                    stats["w_norm_sq"] = float(wd.pow(2).sum().item())
+            if self.cache_dir is not None:
+                need = self.input_rows - self._rows_got[name]
+                if need > 0:
+                    flat = x.detach().reshape(-1, x.size(-1))
+                    if flat.size(0) > need:
+                        idx = torch.randperm(flat.size(0), device=flat.device)[:need]
+                        flat = flat.index_select(0, idx)
+                    self._input_snaps[name].append(flat.to("cpu"))
+                    self._rows_got[name] += flat.size(0)
+        return hook
+
+    def _make_bwd(self, name: str, mod_ref: nn.Linear):
+        def hook(module, grad_input, grad_output):
+            gy = grad_output[0]
+            x = self._saved_inputs.pop(name, None)
+            if x is None or gy is None:
+                return
+            gy2 = gy.reshape(-1, gy.size(-1))
+            x2 = x.reshape(-1, x.size(-1))
+            grad_w = gy2.t() @ x2
+            grad_w_sq = grad_w.pow(2)
+            # Full per-weight Fisher accumulation: required for the
+            # `predicted_dloss = 0.5 · <H_full, MSE_W_full>` cost model
+            # that replaces the scalar `h_trace · mse_scalar` proxy.
+            acc = self._h_full.get(name)
+            if acc is None:
+                # Deferred allocation for disk-offloaded Linears: size
+                # from the current gradient, on CPU so offloaded layers
+                # don't pin GPU memory per-Linear.
+                acc = torch.zeros(
+                    grad_w.shape[0], grad_w.shape[1],
+                    dtype=torch.float32, device="cpu",
+                )
+                self._h_full[name] = acc
+            acc.add_(grad_w_sq.float().to(acc.device))
+            self.stats[name]["h_trace_raw"] += float(grad_w_sq.sum().item())
+            # h_w2_sum is a weight-aware scalar proxy used only as a
+            # fallback when full per-weight Fisher isn't available.
+            # Accelerate offloads the weight back to meta after forward,
+            # so during backward it may not be materialized. Skip the
+            # proxy when meta; the full H in self._h_full already
+            # captures the same information at higher fidelity.
+            w = mod_ref.weight
+            if w is not None and not w.is_meta:
+                wd = w.detach()
+                self.stats[name]["h_w2_sum_raw"] += float(
+                    (grad_w_sq * wd.pow(2)).sum().item())
+            self.stats[name]["n_tokens_seen"] += x2.size(0)
+        return hook
+
+    def finalize(self, tracker: RouterTracker | None):
+        # Flush packed-expert grad-norm accumulator into stats h_trace_raw.
+        # The packed accumulator key matches the stats key by construction
+        # (full param name `<experts_qname>.<param_name>`).
+        for full_name, raw in self._packed_grad_acc.items():
+            if full_name in self.stats:
+                self.stats[full_name]["h_trace_raw"] += float(raw)
+                self.stats[full_name]["n_tokens_seen"] = int(
+                    self._packed_sample_count.get(full_name, 0))
+
+        if tracker is not None:
+            for name, s in self.stats.items():
+                if s["router_path"]:
+                    s["route_prob"] = tracker.prob(
+                        s["router_path"], s["expert_id"])
+
+        for s in self.stats.values():
+            tokens = max(s["n_tokens_seen"], 1)
+            if s["route_prob"] is not None and s["route_prob"] > 0:
+                s["h_trace"] = (s["h_trace_raw"] / tokens) / s["route_prob"]
+                s["h_w2_sum"] = (s["h_w2_sum_raw"] / tokens) / s["route_prob"]
+            else:
+                s["h_trace"] = s["h_trace_raw"] / tokens
+                s["h_w2_sum"] = s["h_w2_sum_raw"] / tokens
+
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            for name, snaps in self._input_snaps.items():
+                if not snaps:
+                    continue
+                X = torch.cat(snaps, dim=0).to(torch.bfloat16).contiguous()
+                fname = re.sub(r"[^A-Za-z0-9_-]", "__", name) + ".pt"
+                torch.save({"inputs": X, "name": name},
+                           self.cache_dir / fname)
+            # Also write packed-experts module input snapshots. We key
+            # these by the experts module qname (not the parameter name);
+            # measure_quant_cost looks for the same input regardless of
+            # which packed parameter is being measured.
+            for experts_qname, snaps in self._packed_act_snaps.items():
+                if not snaps:
+                    continue
+                X = torch.cat(snaps, dim=0).to(torch.bfloat16).contiguous()
+                fname = re.sub(r"[^A-Za-z0-9_-]", "__", experts_qname) + ".pt"
+                torch.save({"inputs": X, "name": experts_qname},
+                           self.cache_dir / fname)
+
+        # Write per-layer Fisher H detail files (the full per-weight
+        # diagonal for Linears, per-expert per-output-channel for packed
+        # experts). The probe pickle stores scalar summaries + the
+        # detail-file path; measure_quant_cost loads them lazily so the
+        # full allocator cost model can run without bloating probe.pkl.
+        if self.h_detail_dir is not None:
+            self.h_detail_dir.mkdir(parents=True, exist_ok=True)
+            sub = re.compile(r"[^A-Za-z0-9_-]")
+            for name, acc in self._h_full.items():
+                if name not in self.stats:
+                    continue
+                tokens = max(self.stats[name]["n_tokens_seen"], 1)
+                rp = self.stats[name].get("route_prob")
+                # Apply the same normalization as the scalar trace.
+                if rp is not None and rp > 0:
+                    h = acc.to(torch.float32).cpu() / (tokens * rp)
+                else:
+                    h = acc.to(torch.float32).cpu() / tokens
+                fname = sub.sub("__", name) + ".pt"
+                torch.save({"h_diag": h, "name": name, "kind": "linear",
+                            "shape": list(h.shape)},
+                           self.h_detail_dir / fname)
+                self.stats[name]["h_detail_path"] = fname
+            for full_name, ch in self._h_packed_channel.items():
+                if full_name not in self.stats:
+                    continue
+                tokens = max(self.stats[full_name]["n_tokens_seen"], 1)
+                # Packed experts don't carry a router_path — routing is
+                # baked into the Fisher signal via how often each expert
+                # was selected. Normalize by token count only.
+                h = ch.to(torch.float32) / tokens
+                fname = sub.sub("__", full_name) + ".pt"
+                torch.save({"h_diag": h, "name": full_name, "kind": "packed",
+                            "shape": list(h.shape)},
+                           self.h_detail_dir / fname)
+                self.stats[full_name]["h_detail_path"] = fname
+
+    def remove_hooks(self):
+        for h in self._fwd_handles + self._bwd_handles:
+            h.remove()
+        self._fwd_handles.clear()
+        self._bwd_handles.clear()
+
+
+# ---------------------------------------------------------------------------
+# Calibration data
+# ---------------------------------------------------------------------------
+def load_calibration(tokenizer, source: str, n_samples: int,
+                     seqlen: int) -> torch.Tensor:
+    """Load calibration from a HuggingFace dataset id, a local .jsonl, or
+    a local .txt file. JSONL rows can have either {"text": ...} or
+    {"messages": [...]} for chat-style data.
+    """
+    import os
+    from datasets import load_dataset
+
+    texts: list[str] = []
+    if source.endswith(".jsonl") and os.path.exists(source):
+        with open(source) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                if "messages" in obj:
+                    try:
+                        texts.append(tokenizer.apply_chat_template(
+                            obj["messages"], tokenize=False))
+                    except Exception:
+                        continue
+                elif "text" in obj:
+                    texts.append(obj["text"])
+    elif source.endswith(".txt") and os.path.exists(source):
+        with open(source) as f:
+            texts = [ln.strip() for ln in f if ln.strip()]
+    elif source == "ultrachat_200k":
+        ds = load_dataset("HuggingFaceH4/ultrachat_200k",
+                          split="train_sft", streaming=True)
+        for row in ds:
+            msgs = row.get("messages", [])
+            if not msgs:
+                continue
+            try:
+                texts.append(tokenizer.apply_chat_template(msgs, tokenize=False))
+            except Exception:
+                # Tokenizer has no chat template (base / pt models).
+                # Join plain message contents — good enough as calibration.
+                parts = []
+                for m in msgs:
+                    if isinstance(m, dict):
+                        c = m.get("content")
+                        if isinstance(c, str) and c:
+                            parts.append(c)
+                if parts:
+                    texts.append("\n\n".join(parts))
+            if len(texts) >= n_samples * 8:
+                break
+    else:
+        # Generic HF dataset loader. Handles three common schemas:
+        #   1. {"text": "..."} — raw text corpora (pile, wikitext, etc.)
+        #   2. {"messages": [...]} — chat-format SFT (ultrachat, tulu-3, etc.)
+        #   3. anything else — falls back to first string column
+        # Streaming when possible so we don't download the full dataset for
+        # just 32 samples.
+        try:
+            ds = load_dataset(source, split="train", streaming=True)
+            stream = True
+        except Exception:
+            ds = load_dataset(source, split="train")
+            stream = False
+
+        # Probe one row to detect schema
+        iterator = iter(ds) if stream else ds
+        first = next(iterator) if stream else (ds[0] if len(ds) else {})
+        schema = None
+        if "messages" in first:
+            schema = "messages"
+        elif "text" in first:
+            schema = "text"
+        else:
+            # pick first string-valued column
+            for k, v in first.items():
+                if isinstance(v, str):
+                    schema = k
+                    break
+        if schema is None:
+            raise ValueError(f"Could not find text or messages field in {source}")
+        print(f"[probe] {source} schema: {schema}", flush=True)
+
+        # Re-iterate (we consumed the first row)
+        if stream:
+            ds = load_dataset(source, split="train", streaming=True)
+            iterator = iter(ds)
+        else:
+            iterator = iter(ds)
+
+        for row in iterator:
+            if schema == "messages":
+                msgs = row.get("messages") or row.get("conversations") or []
+                if not msgs:
+                    continue
+                try:
+                    texts.append(tokenizer.apply_chat_template(msgs, tokenize=False))
+                except Exception:
+                    # Tokenizer has no chat template (base / pt models)
+                    # or the template rejects this message shape.
+                    # Fall back to concatenating the message contents —
+                    # good enough as calibration text, decouples the
+                    # probe from the tokenizer's chat-template state.
+                    parts = []
+                    for m in msgs:
+                        if isinstance(m, dict):
+                            c = m.get("content")
+                            if isinstance(c, str) and c:
+                                parts.append(c)
+                    if parts:
+                        texts.append("\n\n".join(parts))
+            else:
+                v = row.get(schema)
+                if isinstance(v, str) and v.strip():
+                    texts.append(v)
+            if len(texts) >= n_samples * 8:
+                break
+
+    # Two-pass sampling:
+    #   1) first pass picks any sample already >= seqlen tokens
+    #   2) fallback packs multiple short samples together (separated by
+    #      EOS) to reach seqlen. This makes SFT/chat datasets with short
+    #      turns (tulu-3, glaive) usable without lowering seqlen.
+    random.seed(42)
+    samples = []
+    for t in texts:
+        ids = tokenizer(t, return_tensors="pt", truncation=False).input_ids
+        if ids.size(1) < seqlen:
+            continue
+        start = random.randint(0, ids.size(1) - seqlen)
+        samples.append(ids[0, start:start + seqlen])
+        if len(samples) >= n_samples:
+            break
+
+    if len(samples) < n_samples:
+        eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+        # Pack short samples by concatenating with EOS separator
+        buf: list[int] = []
+        for t in texts:
+            ids = tokenizer(t, return_tensors="pt", truncation=False).input_ids[0].tolist()
+            buf.extend(ids)
+            buf.append(eos)
+            while len(buf) >= seqlen and len(samples) < n_samples:
+                samples.append(torch.tensor(buf[:seqlen], dtype=torch.long))
+                buf = buf[seqlen:]
+            if len(samples) >= n_samples:
+                break
+
+    if len(samples) < n_samples:
+        print(f"[probe] warning: only got {len(samples)}/{n_samples} samples "
+              f"(even with packing). Consider wider corpus.",
+              flush=True)
+    return torch.stack(samples[:n_samples], dim=0)
+
+
+def per_token_ce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    ce = F.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        shift_labels.reshape(-1), reduction="none")
+    return ce.view(shift_labels.size())
+
+
+def load_probe_model_and_tokenizer(model_path: str,
+                                   requested_device: str,
+                                   dtype: torch.dtype,
+                                   device_map: str | None = None,
+                                   gradient_checkpointing: bool = True,
+                                   offload_folder: str | None = None):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    staged = stage_text_only(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(staged, trust_remote_code=True)
+    load_device_map = device_map if device_map is not None else requested_device
+
+    from_pretrained_kwargs = {
+        "torch_dtype": dtype,
+        "device_map": load_device_map,
+        "low_cpu_mem_usage": False,
+        "trust_remote_code": True,
+    }
+    if offload_folder is not None:
+        import os as _os
+        _os.makedirs(offload_folder, exist_ok=True)
+        from_pretrained_kwargs["offload_folder"] = offload_folder
+        from_pretrained_kwargs["offload_buffers"] = True
+        # low_cpu_mem_usage is forced True internally when device_map is set;
+        # disable the explicit override to let HF pick whatever's correct.
+        from_pretrained_kwargs.pop("low_cpu_mem_usage", None)
+    model = AutoModelForCausalLM.from_pretrained(staged, **from_pretrained_kwargs)
+    model.eval()
+
+    # Packed MoE experts (e.g. Qwen3.5/3.6's 3D `gate_up_proj` /
+    # `down_proj`) are sensed natively by FisherAccumulator via
+    # install_packed_expert_hooks. No unfuse step needed; auto_round is
+    # not a probe-time dependency.
+
+    exec_device = resolve_execution_device(model, requested_device)
+    print(f"[probe] execution device: {exec_device} "
+          f"(load device_map={load_device_map})", flush=True)
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+
+    return staged, tokenizer, model, exec_device, load_device_map
+
+
+def run_probe_pass(model: nn.Module,
+                   tokenizer,
+                   calib: torch.Tensor,
+                   model_name: str,
+                   dataset_name: str,
+                   seqlen: int,
+                   dtype_name: str,
+                   requested_device: str,
+                   load_device_map,
+                   exec_device: torch.device,
+                   linear_include: str,
+                   linear_exclude: str,
+                   importance_weighting: bool,
+                   activation_cache_dir: str | None,
+                   output_path: str,
+                   h_detail_dir: str | None = None):
+    inc = re.compile(linear_include)
+    exc = re.compile(linear_exclude)
+    tracked = [n for n, m in model.named_modules()
+               if isinstance(m, nn.Linear)
+               and inc.search(n) and not exc.search(n)]
+    print(f"[probe] tracking {len(tracked)} Linear layers", flush=True)
+
+    expert_info_all = discover_moe_structure(model)
+    expert_info = {k: v for k, v in expert_info_all.items() if k in tracked}
+    top_k = read_top_k(model, default=2)
+    routers = sorted({r for r, _ in expert_info.values()})
+    print(f"[probe] MoE: {len(expert_info)} expert linears, "
+          f"{len(routers)} routers, top_k={top_k}", flush=True)
+    if len(expert_info) == 0:
+        diag_count = 0
+        for pname, pmod in model.named_modules():
+            for attr in ("experts", "block_sparse_moe_experts",
+                         "moe_experts", "expert_layer"):
+                child = getattr(pmod, attr, None)
+                if child is None or not isinstance(child, nn.Module):
+                    continue
+                kids = list(child.named_children())
+                numkids = [k for k, _ in kids if k.isdigit()]
+                print(f"[probe/diag] parent={pname!r} attr={attr!r} "
+                      f"container_cls={type(child).__name__} "
+                      f"n_children={len(kids)} n_numeric_children={len(numkids)}"
+                      f" first_children={[k for k,_ in kids[:5]]}",
+                      flush=True)
+                diag_count += 1
+                if diag_count >= 3:
+                    break
+            if diag_count >= 3:
+                break
+
+    tracker = RouterTracker(model, routers, top_k) if routers else None
+    cache_dir = Path(activation_cache_dir) if activation_cache_dir else None
+    detail_dir = Path(h_detail_dir) if h_detail_dir else None
+    acc = FisherAccumulator(model, tracked, expert_info, cache_dir,
+                            h_detail_dir=detail_dir)
+
+    print(f"[probe] calibration shape: {calib.shape}", flush=True)
+
+    model.train()
+    t_fwd = t_bwd = 0.0
+    for i in range(calib.size(0)):
+        ids = calib[i:i+1].to(exec_device)
+        t0 = time.time()
+        with torch.no_grad():
+            embed = model.get_input_embeddings()(ids)
+        embed.requires_grad_(True)
+        out = model(inputs_embeds=embed, labels=ids)
+        logits = out.logits
+        t_fwd += time.time() - t0
+
+        t0 = time.time()
+        # Use sum-reduction CE so per-token gradients aggregate without
+        # the 1/T factor that mean-reduction introduces. The accumulated
+        # ||grad_W||²_F divided by total tokens then gives the per-token
+        # empirical Fisher diagonal trace under the standard assumption
+        # of independence across token positions.
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = ids[..., 1:].contiguous()
+        lp = F.log_softmax(
+            shift_logits.reshape(-1, shift_logits.size(-1)), dim=-1)
+        gather = -lp.gather(1, shift_labels.reshape(-1, 1)).squeeze(1)
+        if importance_weighting:
+            with torch.no_grad():
+                tok = per_token_ce(logits.detach(), ids).reshape(-1)
+                mean = float(tok.mean().item())
+            # Importance weights renormalized to mean ~1 so the per-token
+            # Fisher units are preserved (the weights only redistribute
+            # contributions across token positions, not change the total).
+            w = (tok / max(mean, 1e-6)).clamp(0.25, 4.0)
+            loss = (gather * w).sum()
+        else:
+            loss = gather.sum()
+        loss.backward()
+        t_bwd += time.time() - t0
+
+        if (i + 1) % 4 == 0 or i == 0:
+            n_tok = max(int(gather.numel()), 1)
+            mean_loss = float(loss.detach().item()) / n_tok
+            print(f"[probe] sample {i+1}/{calib.size(0)} "
+                  f"loss={mean_loss:.3f} "
+                  f"fwd_avg={t_fwd/(i+1):.2f}s bwd_avg={t_bwd/(i+1):.2f}s",
+                  flush=True)
+
+        del out, loss, ids, embed, logits
+        acc._saved_inputs.clear()
+
+    acc.finalize(tracker)
+    acc.remove_hooks()
+    if tracker is not None:
+        tracker.remove_hooks()
+
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump({
+            "stats": acc.stats,
+            "router_counts": dict(tracker.counts) if tracker else {},
+            "router_totals": dict(tracker.total_tokens) if tracker else {},
+            "expert_info": expert_info,
+            "meta": {
+                "model": model_name,
+                "dataset": dataset_name,
+                "nsamples": calib.size(0),
+                "seqlen": seqlen,
+                "dtype": dtype_name,
+                "device_map": str(load_device_map),
+                "execution_device": str(exec_device),
+                "top_k": top_k,
+                "importance_weighting": importance_weighting,
+                "activation_cache_dir": str(cache_dir) if cache_dir else None,
+                "linear_include": linear_include,
+                "linear_exclude": linear_exclude,
+            },
+        }, f)
+    print(f"[probe] wrote {out_path}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 multimodal visual Fisher probe — non-streaming second pass
+# ---------------------------------------------------------------------------
+def run_multimodal_visual_probe_pass(
+    model_path: str,
+    *,
+    dataset_name: str,
+    n_samples: int,
+    max_text_len: int,
+    requested_device: str,
+    dtype: torch.dtype,
+    linear_include: str,
+    linear_exclude: str,
+    activation_cache_dir: str | None,
+    output_path: str,
+    h_detail_dir: str | None = None,
+) -> bool:
+    """Non-streaming multimodal Fisher probe focused on the visual encoder.
+
+    Loads the FULL multimodal model via `AutoModelForCausalLM` (so the
+    visual tower materializes alongside the body), runs each
+    (pixel_values, input_ids, labels) triple through forward + supervised
+    CE backward, and captures per-visual-Linear Fisher via
+    `FisherAccumulator`. Activation snapshots go to the same
+    `activation_cache_dir` the streaming body path uses, so the cost
+    stage and export stage both see visual Linears under their canonical
+    recipe names.
+
+    Visual tower on Qwen3.6-35B is ~1 GB BF16 plus ~70 GB body weights —
+    fits under a 128 GB budget. For very large VLMs (e.g. 122B) where the
+    body alone exceeds RAM, this function catches the OOM / load error,
+    logs a warning, returns False, and the caller falls back to the Phase
+    1 uniform `--visual-format` override. No partial calibration is
+    written on failure.
+
+    Returns True on successful probe completion (output pickle written),
+    False on graceful fallback. Raises only on unexpected errors
+    (not OOM / resource shortage).
+    """
+    from transformers import AutoModelForCausalLM, AutoProcessor
+
+    staged = stage_multimodal(model_path)
+    try:
+        processor = AutoProcessor.from_pretrained(model_path,
+                                                  trust_remote_code=True)
+    except Exception:
+        try:
+            processor = AutoProcessor.from_pretrained(staged,
+                                                      trust_remote_code=True)
+        except Exception as e:
+            print(f"[probe/mm] AutoProcessor.from_pretrained failed "
+                  f"({type(e).__name__}: {e}); skipping multimodal pass. "
+                  f"Falling back to --visual-format Phase 1 override.",
+                  flush=True)
+            return False
+
+    triples = load_multimodal_calibration(
+        processor, dataset_name, n_samples, max_text_len)
+    print(f"[probe/mm] loaded {len(triples)} multimodal samples "
+          f"(dataset={dataset_name!r})", flush=True)
+    if not triples:
+        print("[probe/mm] load_multimodal_calibration returned 0 samples; "
+              "skipping multimodal pass", flush=True)
+        return False
+
+    # Load the DECLARED arch directly, bypassing AutoModelForCausalLM's
+    # silent text-only downgrade path. `AutoModelForCausalLM` resolves
+    # Qwen3_5MoeConfig → Qwen3_5MoeForCausalLM (text-only), which
+    # matches `config.sub_configs["text_config"]` and triggers
+    # transformers/auto_factory.py:132-134 to swap the composite config
+    # for just the text sub-config. The visual tower tensors in the
+    # safetensors are then silently dropped, and `named_modules()`
+    # returns 0 Linears under `model.visual.*`. Use
+    # `config.architectures[0]` to instantiate the multimodal class
+    # (Qwen3_5MoeForConditionalGeneration), which keeps the visual
+    # tower wired.
+    try:
+        import transformers
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(staged, trust_remote_code=True)
+        arch_names = getattr(cfg, "architectures", None) or []
+        if arch_names and hasattr(transformers, arch_names[0]):
+            model_cls = getattr(transformers, arch_names[0])
+            model = model_cls.from_pretrained(
+                staged, torch_dtype=dtype, device_map=requested_device,
+                low_cpu_mem_usage=False, trust_remote_code=True,
+            )
+        else:
+            # No declared arch (or not importable) — fall back to the
+            # auto class. Works for non-composite-config text-only models.
+            model = AutoModelForCausalLM.from_pretrained(
+                staged, torch_dtype=dtype, device_map=requested_device,
+                low_cpu_mem_usage=False, trust_remote_code=True,
+            )
+    except (torch.cuda.OutOfMemoryError, RuntimeError, MemoryError) as e:
+        msg = str(e).lower()
+        if ("out of memory" in msg or "oom" in msg
+                or isinstance(e, (torch.cuda.OutOfMemoryError, MemoryError))):
+            print(f"[probe/mm] whole-model multimodal load OOM "
+                  f"({type(e).__name__}); falling back to --visual-format "
+                  f"Phase 1 override. On 122B-scale models this is expected.",
+                  flush=True)
+            return False
+        # Other RuntimeError (weight mismatch, etc.) isn't OOM — re-raise.
+        raise
+    model.eval()
+    exec_device = resolve_execution_device(model, requested_device)
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    inc = re.compile(linear_include)
+    exc = re.compile(linear_exclude)
+    tracked = [n for n, m in model.named_modules()
+               if isinstance(m, nn.Linear)
+               and inc.search(n) and not exc.search(n)]
+    print(f"[probe/mm] tracking {len(tracked)} Linear layers "
+          f"(include={linear_include!r})", flush=True)
+
+    expert_info_all = discover_moe_structure(model)
+    expert_info = {k: v for k, v in expert_info_all.items() if k in tracked}
+    top_k = read_top_k(model, default=2)
+    routers = sorted({r for r, _ in expert_info.values()})
+    tracker = RouterTracker(model, routers, top_k) if routers else None
+
+    cache_dir = Path(activation_cache_dir) if activation_cache_dir else None
+    detail_dir = Path(h_detail_dir) if h_detail_dir else None
+    acc = FisherAccumulator(model, tracked, expert_info, cache_dir,
+                            h_detail_dir=detail_dir)
+
+    model.train()
+    t_fwd = t_bwd = 0.0
+    for i, (pixel_values, input_ids, labels) in enumerate(triples):
+        pixel_values = pixel_values.to(exec_device, dtype=dtype)
+        input_ids = input_ids.to(exec_device)
+        labels = labels.to(exec_device)
+        t0 = time.time()
+        try:
+            out = model(pixel_values=pixel_values,
+                        input_ids=input_ids,
+                        labels=labels)
+        except Exception as e:
+            print(f"[probe/mm] sample {i}: forward raised {type(e).__name__}: "
+                  f"{e}; skipping", flush=True)
+            acc._saved_inputs.clear()
+            continue
+        logits = out.logits
+        t_fwd += time.time() - t0
+
+        t0 = time.time()
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        lp = F.log_softmax(
+            shift_logits.reshape(-1, shift_logits.size(-1)), dim=-1)
+        valid = shift_labels.reshape(-1)
+        mask = (valid >= 0) & (valid < shift_logits.size(-1))
+        if not mask.any():
+            acc._saved_inputs.clear()
+            continue
+        gather = -lp[mask.nonzero(as_tuple=True)[0]].gather(
+            1, valid[mask].reshape(-1, 1)).squeeze(1)
+        loss = gather.sum()
+        loss.backward()
+        t_bwd += time.time() - t0
+
+        print(f"[probe/mm] sample {i + 1}/{len(triples)} "
+              f"loss={float(loss) / max(gather.numel(), 1):.3f} "
+              f"fwd_avg={t_fwd / (i + 1):.2f}s "
+              f"bwd_avg={t_bwd / (i + 1):.2f}s", flush=True)
+
+        del out, loss, logits
+        acc._saved_inputs.clear()
+
+    acc.finalize(tracker)
+    acc.remove_hooks()
+    if tracker is not None:
+        tracker.remove_hooks()
+
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump({
+            "stats": acc.stats,
+            "router_counts": dict(tracker.counts) if tracker else {},
+            "router_totals": dict(tracker.total_tokens) if tracker else {},
+            "expert_info": expert_info,
+            "meta": {
+                "model": model_path,
+                "dataset": dataset_name,
+                "nsamples": len(triples),
+                "seqlen": max_text_len,
+                "dtype": str(dtype),
+                "device_map": requested_device,
+                "execution_device": str(exec_device),
+                "top_k": top_k,
+                "importance_weighting": False,
+                "activation_cache_dir": str(cache_dir) if cache_dir else None,
+                "linear_include": linear_include,
+                "linear_exclude": linear_exclude,
+                "calibration_modality": "multimodal",
+            },
+        }, f)
+    print(f"[probe/mm] wrote {out_path}", flush=True)
+    return True
