@@ -2338,35 +2338,54 @@ def main():
                          "computed from cached activations "
                          "(max_abs/6.0) instead of the 1.0 default. "
                          "Typically ~1-3% PPL improvement on NVFP4.")
-    # Activation-aware passes. Defaults are tri-state: `None` means
-    # "auto = ON when --activation-cache-dir is supplied, OFF otherwise".
-    # Explicit `--awq / --no-awq` overrides.
+    # Activation-aware passes.
+    #
+    # AWQ defaults to OFF — per-channel input scaling fights NVFP4's
+    # 16-channel group_size: each FP4 group ends up with a mix of
+    # scale-boosted (up to 10×) and scale-damped (down to 0.1×) input
+    # channels, inflating per-group max-abs and DOUBLING quant error
+    # instead of reducing it. Measured PPL on Qwen3.6-35B:
+    #     baseline (no act-aware)  4.97
+    #     AWQ only                 16.44   (+230%, much worse)
+    #     GPTQ only                 4.84   (-2.7%)
+    #     act-weighted-round only   4.88   (-1.8%)
+    # AWQ was designed for W4A16 per-channel quant where no group
+    # structure competes with its rescaling. For group-quant like
+    # NVFP4 (or any 8/16-wide group), prefer GPTQ + act-weighted
+    # rounding which ARE group-aware. Set --awq explicitly to opt in.
+    #
+    # GPTQ and --act-weighted-round remain tri-state "auto-on when
+    # --activation-cache-dir is supplied" because they measurably help.
     ap.add_argument("--awq", dest="awq", default=None,
                     action=argparse.BooleanOptionalAction,
-                    help="AWQ per-input-channel quant-range balancing "
-                         "(approximate — see docstring). Auto-on when "
-                         "--activation-cache-dir is supplied.")
+                    help="AWQ per-input-channel rescale + γ-fold. OFF "
+                         "by default — incompatible with NVFP4 "
+                         "group_size=16 (see source comment). Pass "
+                         "--awq to opt in.")
     ap.add_argument("--gptq", dest="gptq", default=None,
                     action=argparse.BooleanOptionalAction,
                     help="GPTQ one-shot OBS rounding with block-wise "
                          "error propagation (NVFP4 only; skipped on "
                          "MXFP8). Auto-on when --activation-cache-dir "
-                         "is supplied.")
+                         "is supplied. Measured -2.7% PPL on Qwen3.6-35B.")
     ap.add_argument("--act-weighted-round", dest="awq_round", default=None,
                     action=argparse.BooleanOptionalAction,
                     help="Activation-weighted rounding polish on NVFP4 "
                          "(closed-form Δw²·E[a²] minimization). Auto-on "
-                         "when --activation-cache-dir is supplied.")
+                         "when --activation-cache-dir is supplied. "
+                         "Measured -1.8% PPL on Qwen3.6-35B.")
     args = ap.parse_args()
 
     from .model_profiles import detect_profile
     profile = detect_profile(args.model)
     print(f"[export-stream] model profile: {profile.name}", flush=True)
 
-    # Resolve tri-state flags: each defaults to ON iff activation cache
-    # is supplied.
+    # Resolve flag defaults.
     cache_supplied = bool(args.activation_cache_dir)
-    awq_enabled = args.awq if args.awq is not None else cache_supplied
+    # AWQ: OFF unless explicitly requested. Incompatible with NVFP4
+    # group_size=16 (see long comment on the argparse definition).
+    awq_enabled = bool(args.awq) if args.awq is not None else False
+    # GPTQ + act-weighted rounding: ON iff activation cache supplied.
     gptq_enabled = args.gptq if args.gptq is not None else cache_supplied
     awq_round_enabled = (args.awq_round if args.awq_round is not None
                          else cache_supplied)
