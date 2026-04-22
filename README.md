@@ -351,26 +351,13 @@ export WORK_DIR=./dq-runs/qwen36
 export FORMATS=NVFP4,MXFP8_E4M3,BF16
 export TARGET_BITS=4.75
 
-./quantization/prismaquant/run-pipeline.sh
+./prismaquant/run-pipeline.sh
 ```
 
-That runs probe → cost → allocator → native export.  Extend the probe
-to cover MTP heads:
-
-```bash
-python -m quantization.prismaquant.mtp_probe \
-  --model $MODEL_PATH --nsamples 4 --seqlen 256 \
-  --activation-cache-dir $WORK_DIR/act_mtp \
-  --output $WORK_DIR/artifacts/mtp_probe.pkl
-
-python -m quantization.prismaquant.mtp_cost \
-  --model $MODEL_PATH \
-  --activation-cache-dir $WORK_DIR/act_mtp \
-  --output $WORK_DIR/artifacts/mtp_cost.pkl
-```
-
-Merge the MTP probe / cost into the body artifacts (see
-`run-pipeline.sh`), re-run the allocator and exporter, then serve:
+That runs probe → cost → allocator → native export. MTP heads, when
+present in the source model (e.g. Qwen3.5 / 3.6), are covered
+automatically as a built-in shard kind inside `incremental_probe` and
+`incremental_measure_quant_cost` — no separate command needed. Serve:
 
 ```bash
 vllm serve $WORK_DIR/exported \
@@ -1079,7 +1066,7 @@ preprint covering the closed-form allocator math, the
 is forthcoming.
 
 ```bibtex
-@software{prismquant2026,
+@software{prismaquant2026,
   title        = {prismaquant: Mixed-Precision Quantization via
                   Fisher-Weighted Bit Allocation},
   author       = {Tand, Rob and contributors},

@@ -29,7 +29,7 @@ from unittest import mock
 import torch
 import torch.nn as nn
 
-from quantization.prismaquant.sensitivity_probe import (
+from prismaquant.sensitivity_probe import (
     _synthetic_multimodal_calibration_samples,
     load_multimodal_calibration,
     stage_multimodal,
@@ -162,7 +162,7 @@ class TestMultimodalProbeFlagParsing(unittest.TestCase):
     def test_flags_in_incremental_probe_argparser(self):
         # Import the module's argparser the way main() does, but without
         # triggering the heavy run.
-        from quantization.prismaquant import incremental_probe
+        from prismaquant import incremental_probe
 
         src = inspect_source(incremental_probe.main)
         # The flag surface we expose should be discoverable in main()'s
@@ -175,7 +175,7 @@ class TestMultimodalProbeFlagParsing(unittest.TestCase):
         self.assertIn("--mm-max-text-len", src)
 
     def test_default_calibration_modality_is_text_only(self):
-        from quantization.prismaquant import incremental_probe
+        from prismaquant import incremental_probe
         src = inspect_source(incremental_probe.main)
         # Search for the default= in the argparse add_argument.
         self.assertIn('default="text-only"', src)
@@ -191,10 +191,10 @@ class TestVisualCostShardBasic(unittest.TestCase):
     without raising, and emits a shard pickle the merger can consume."""
 
     def test_empty_shard_when_no_matching_stats(self):
-        from quantization.prismaquant.incremental_measure_quant_cost import (
+        from prismaquant.incremental_measure_quant_cost import (
             _run_visual_cost_shard,
         )
-        from quantization.prismaquant import format_registry as fr
+        from prismaquant import format_registry as fr
 
         specs = [fr.get_format("BF16"), fr.get_format("NVFP4")]
         with tempfile.TemporaryDirectory() as td:
@@ -236,10 +236,10 @@ class TestVisualCostShardBasic(unittest.TestCase):
         """When the multimodal streaming context build raises CUDA OOM,
         we fall back to an empty pickle instead of raising — 122B-scale
         behavior."""
-        from quantization.prismaquant.incremental_measure_quant_cost import (
+        from prismaquant.incremental_measure_quant_cost import (
             _run_visual_cost_shard,
         )
-        from quantization.prismaquant import format_registry as fr
+        from prismaquant import format_registry as fr
 
         specs = [fr.get_format("BF16")]
         with tempfile.TemporaryDirectory() as td:
@@ -259,7 +259,7 @@ class TestVisualCostShardBasic(unittest.TestCase):
             # guard should catch that as an OOM proxy and fall back
             # gracefully with an empty pickle.
             with mock.patch(
-                    "quantization.prismaquant.incremental_measure_quant_cost."
+                    "prismaquant.incremental_measure_quant_cost."
                     "_build_streaming_context",
                     side_effect=RuntimeError("CUDA out of memory")):
                 result = _run_visual_cost_shard(
@@ -298,7 +298,7 @@ class TestAllocatorVisualSensitivityModes(unittest.TestCase):
     def test_visual_fisher_available_detects_both_probe_and_cost(self):
         # Helper replicated here since it's defined inside main(); we
         # test its guts via the public flow below.
-        from quantization.prismaquant.allocator import _is_visual_linear
+        from prismaquant.allocator import _is_visual_linear
         body = {"model.layers.0.self_attn.q_proj": 1,
                 "mtp.layers.0.mlp.gate_proj": 1}
         visual = {"model.visual.blocks.0.attn.qkv": 1}
@@ -311,7 +311,7 @@ class TestAllocatorVisualSensitivityModes(unittest.TestCase):
         # When --visual-sensitivity=uniform, visual Linears are stamped
         # with --visual-format regardless of whether probe had them.
         # This is the Phase 1 path preserved.
-        from quantization.prismaquant.allocator import (
+        from prismaquant.allocator import (
             apply_visual_format_override,
         )
         assignment = {
@@ -326,7 +326,7 @@ class TestAllocatorVisualSensitivityModes(unittest.TestCase):
         # Replicate the _visual_fisher_available predicate at test level:
         # a probe+cost combo is "Fisher available" iff both carry at
         # least one visual-prefix entry.
-        from quantization.prismaquant.allocator import _is_visual_linear
+        from prismaquant.allocator import _is_visual_linear
 
         stats_with = {"model.visual.blocks.0.attn.qkv": {}}
         stats_without = {"model.layers.0.self_attn.q_proj": {}}
@@ -350,7 +350,7 @@ class TestQuantize2DVisualActivationsRoundtrip(unittest.TestCase):
     — this test confirms the cache lookup triggers the AWQ pass."""
 
     def test_awq_enabled_reads_visual_activations_from_cache(self):
-        from quantization.prismaquant import export_native_compressed as exp
+        from prismaquant import export_native_compressed as exp
 
         visual_name = "model.visual.blocks.0.attn.qkv"
         # Rank-2 weight with in_features divisible by NVFP4 group_size=16.
@@ -382,7 +382,7 @@ class TestQuantize2DVisualActivationsRoundtrip(unittest.TestCase):
         # If _CACHED_ACTIVATIONS doesn't have the visual key, AWQ is a
         # no-op (the path checks `acts is not None` at each step).
         # Still produces a valid NVFP4 triple.
-        from quantization.prismaquant import export_native_compressed as exp
+        from prismaquant import export_native_compressed as exp
 
         visual_name = "model.visual.merger.mlp.0"
         W = torch.randn(32, 32, dtype=torch.bfloat16)
@@ -405,7 +405,7 @@ class TestQuantize2DVisualActivationsRoundtrip(unittest.TestCase):
         # produce the same-shape packed output as a body Linear of the
         # same weight shape — sanity that the cache lookup is name-
         # agnostic beyond the dictionary indexing.
-        from quantization.prismaquant import export_native_compressed as exp
+        from prismaquant import export_native_compressed as exp
 
         W = torch.randn(32, 32, dtype=torch.bfloat16)
         acts = torch.randn(64, 32, dtype=torch.float32)
@@ -436,7 +436,7 @@ class TestMultimodalProbePassIntegration(unittest.TestCase):
     failed) — no partial pickle is written."""
 
     def test_zero_triples_returns_false(self):
-        from quantization.prismaquant import sensitivity_probe as sp
+        from prismaquant import sensitivity_probe as sp
 
         with tempfile.TemporaryDirectory() as td:
             tdp = Path(td)
@@ -469,7 +469,7 @@ class TestMultimodalProbePassIntegration(unittest.TestCase):
             self.assertFalse(out.exists())
 
     def test_processor_load_failure_returns_false(self):
-        from quantization.prismaquant import sensitivity_probe as sp
+        from prismaquant import sensitivity_probe as sp
 
         with tempfile.TemporaryDirectory() as td:
             tdp = Path(td)
@@ -503,26 +503,23 @@ class TestPipelineCalibrationModalityEnv(unittest.TestCase):
     commands."""
 
     def test_pipeline_has_calibration_modality_default(self):
-        script = Path(
-            "/home/rob/spark-vllm-docker/quantization/prismaquant/"
-            "run-pipeline.sh"
+        script = (
+            Path(__file__).resolve().parent.parent / "prismaquant" / "run-pipeline.sh"
         ).read_text()
         self.assertIn('CALIBRATION_MODALITY:=text-only', script)
         self.assertIn('MM_DATASET:=synthetic', script)
 
     def test_pipeline_threads_flags_to_probe(self):
-        script = Path(
-            "/home/rob/spark-vllm-docker/quantization/prismaquant/"
-            "run-pipeline.sh"
+        script = (
+            Path(__file__).resolve().parent.parent / "prismaquant" / "run-pipeline.sh"
         ).read_text()
         self.assertIn("--calibration-modality", script)
         self.assertIn("--mm-dataset", script)
         self.assertIn("--mm-nsamples", script)
 
     def test_pipeline_picks_visual_sensitivity_from_modality(self):
-        script = Path(
-            "/home/rob/spark-vllm-docker/quantization/prismaquant/"
-            "run-pipeline.sh"
+        script = (
+            Path(__file__).resolve().parent.parent / "prismaquant" / "run-pipeline.sh"
         ).read_text()
         # When CALIBRATION_MODALITY=multimodal → VISUAL_SENSITIVITY=fisher
         self.assertIn('VISUAL_SENSITIVITY=fisher', script)

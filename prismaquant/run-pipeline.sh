@@ -9,7 +9,7 @@
 #   TARGET_BITS=4.75 \
 #   VISUAL_FORMAT=BF16 \
 #   CALIBRATION_MODALITY=text-only \
-#   ./quantization/prismaquant/run-pipeline.sh
+#   ./prismaquant/run-pipeline.sh
 #
 # VISUAL_FORMAT (BF16 | NVFP4 | MXFP8) applies to visual-encoder Linears
 # on multimodal models. In text-only calibration mode it's the Phase 1
