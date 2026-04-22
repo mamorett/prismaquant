@@ -32,17 +32,21 @@ import os
 from pathlib import Path
 
 
-DEFAULT_SAFETY_GB = 40.0     # slack for CUDA allocator spikes, HF transformers
-                             # overhead, tokenizer caches, OS, prefetch buffers.
-                             # 20 GB triggered OOM on Qwen3.6-27B dense (hit 9 GB
-                             # swap before SIGKILL); 40 GB has proven absorbent.
-                             # NEVER rely on swap — kernel OOM-kills BEFORE swap
-                             # fills on many Linux configs.
-DEFAULT_ACT_MULT = 12        # multiplier in (N*T*hidden*dtype*K) per layer.
-                             # 8 models steady-state activation retention; backward
-                             # passes transiently allocate ~50% more scratch tensors
-                             # that the caching allocator holds. 12 covers the peak.
+DEFAULT_SAFETY_GB = 20.0     # slack above the committed estimate. NEVER rely on
+                             # swap — kernel OOM-kills BEFORE swap fills on many
+                             # Linux configs.
+DEFAULT_ACT_MULT = 12        # multiplier in (N*T*hidden*dtype*K) per tracked
+                             # layer. Captures backward transient scratch.
 DEFAULT_DTYPE_BYTES = 2      # bf16
+# Observed on Qwen3.6-27B dense: gradient checkpointing retains activations
+# at ~sqrt(n_layers) boundaries, so the full autograd graph adds a
+# per-layer-mix overhead independent of how many layers are tracked. Plus
+# HF transformers wrappers, tokenizer caches, and Python heap contribute a
+# roughly model-independent floor. Empirically ~35 GB at nsamples=32,
+# seqlen=1024, hidden=5120. Scale by N*T*hidden so the term tracks
+# calibration size.
+DEFAULT_FULL_GRAPH_ACT_MULT = 48   # 64 layers × sqrt ≈ 8 × 6 (per-layer-mix overshoot)
+DEFAULT_FIXED_OVERHEAD_GB = 15.0   # HF transformers + tokenizer + Python heap floor
 
 
 def _num_layers(cfg: dict) -> int:
@@ -122,6 +126,8 @@ def pick_layers_per_shard(
     dtype_bytes: int = DEFAULT_DTYPE_BYTES,
     act_mult: int = DEFAULT_ACT_MULT,
     safety_gb: float = DEFAULT_SAFETY_GB,
+    full_graph_act_mult: int = DEFAULT_FULL_GRAPH_ACT_MULT,
+    fixed_overhead_gb: float = DEFAULT_FIXED_OVERHEAD_GB,
     available_ram_bytes: int | None = None,
     hold_all_layers_in_cache: bool = True,
     default: int = 2,
@@ -157,13 +163,23 @@ def pick_layers_per_shard(
     else:
         cache_reserve = (n_layers // 2) * per_layer_weight
 
-    shard_budget = avail - safety - cache_reserve
+    # Full-graph checkpointed activations: autograd retains activations
+    # at ~sqrt(n_layers) boundaries across ALL layers, not just tracked
+    # ones — this is fixed memory that any shard incurs. Plus HF /
+    # tokenizer / Python overhead floor.
+    full_graph_act = nsamples * seqlen * hidden * dtype_bytes * full_graph_act_mult
+    overhead = int(fixed_overhead_gb * 1024 ** 3)
+
+    shard_budget = avail - safety - cache_reserve - full_graph_act - overhead
     # If reserving the full cache leaves too little, fall back to half-cache
     if shard_budget < per_layer_active and hold_all_layers_in_cache:
         return pick_layers_per_shard(
             model_path, nsamples=nsamples, seqlen=seqlen,
             dtype_bytes=dtype_bytes, act_mult=act_mult,
-            safety_gb=safety_gb, available_ram_bytes=avail,
+            safety_gb=safety_gb,
+            full_graph_act_mult=full_graph_act_mult,
+            fixed_overhead_gb=fixed_overhead_gb,
+            available_ram_bytes=avail,
             hold_all_layers_in_cache=False, default=default,
         )
     shard_budget = max(shard_budget, per_layer_active)  # never below 1 layer
@@ -177,6 +193,8 @@ def pick_layers_per_shard(
         "hidden": hidden,
         "per_layer_weight_gb": per_layer_weight / 1024 ** 3,
         "per_layer_active_gb": per_layer_active / 1024 ** 3,
+        "full_graph_act_gb": full_graph_act / 1024 ** 3,
+        "fixed_overhead_gb": fixed_overhead_gb,
         "available_gb": avail / 1024 ** 3,
         "safety_gb": safety_gb,
         "cache_reserve_gb": cache_reserve / 1024 ** 3,
