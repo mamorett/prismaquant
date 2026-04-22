@@ -135,8 +135,18 @@ def test_aggregation_groups_qkv_and_gate_up_only():
     assert any(n.endswith(".down_proj") for n in cands_ext)
 
 
-def test_super_linear_predicted_dloss_is_exact_sum_of_members():
-    """Super-Linear's Δloss for format f must equal Σ member predicted_dloss."""
+def test_super_linear_predicted_dloss_uses_max_not_sum():
+    """Super-Linear's Δloss for format f must equal
+    `max(per-sibling predicted_dloss) * n_members`, NOT sum.
+
+    Pinned after observing catastrophic 35B-A3B re-export failure
+    where sum-aggregation let the DP pick cheap formats that
+    destroyed the most-sensitive sibling. See task #22 / commit
+    history. `max` captures the real constraint: siblings receive
+    the same tokens, so the group is only as robust as its most-
+    sensitive member. Scaling by n_members keeps the magnitude
+    comparable to a super-Linear of that total param count.
+    """
     names, stats, costs = _mk_stats_and_costs()
     specs = _format_specs()
     cands = build_candidates(stats, costs, specs)
@@ -147,15 +157,56 @@ def test_super_linear_predicted_dloss_is_exact_sum_of_members():
 
     qkv_super = next(n for n in cands_ext if "qkv_proj" in n)
     qkv_members = [n for n in names if n.endswith((".q_proj", ".k_proj", ".v_proj"))]
+    n_members = len(qkv_members)
 
     for c in cands_ext[qkv_super]:
-        expected = sum(
-            costs[m][c.fmt]["predicted_dloss"] for m in qkv_members
-        )
+        per_sibling = [costs[m][c.fmt]["predicted_dloss"] for m in qkv_members]
+        expected = max(per_sibling) * n_members
         assert abs(c.predicted_dloss - expected) < 1e-9, (
             f"format {c.fmt}: super Δloss={c.predicted_dloss} "
-            f"vs expected sum={expected}"
+            f"vs expected max*n={expected} (per-sibling {per_sibling})"
         )
+
+
+def test_asymmetric_sensitivity_picks_safe_format():
+    """Regression: if one qkv sibling has much higher Δloss at NVFP4 than
+    its peers, the max-aggregated super-Linear must surface that spike
+    in its NVFP4 candidate — so the DP prefers a safer format for the
+    group. This is the 35B-A3B failure mode: previously sum-aggregation
+    averaged the sensitive sibling's cost with the cheap ones, letting
+    the DP pick NVFP4 and blow up inference.
+    """
+    import prismaquant.format_registry as fr
+    from prismaquant.allocator import aggregate_fused_siblings, build_candidates
+    layer = "model.layers.0"
+    names_ = [f"{layer}.self_attn.q_proj",
+              f"{layer}.self_attn.k_proj",
+              f"{layer}.self_attn.v_proj"]
+    stats = {}
+    costs = {}
+    # q and k are insensitive (Δloss at NVFP4 ≈ 1); v is SENSITIVE (Δloss ≈ 1000).
+    dlosses = {"q_proj": 1.0, "k_proj": 1.0, "v_proj": 1000.0}
+    for n in names_:
+        leaf = n.rsplit(".", 1)[1]
+        stats[n] = {"h_trace": 1.0, "n_params": 1024 * 1024,
+                    "in_features": 1024, "out_features": 1024}
+        costs[n] = {
+            "NVFP4": {"weight_mse": dlosses[leaf] / 0.5,
+                      "predicted_dloss": dlosses[leaf]},
+            "BF16":  {"weight_mse": 0.0, "predicted_dloss": 0.0},
+        }
+    specs = [fr.REGISTRY["NVFP4"], fr.REGISTRY["BF16"]]
+    cands = build_candidates(stats, costs, specs)
+    _, _, cands_ext = aggregate_fused_siblings(
+        stats, costs, specs, cands, _FakeProfile())
+    super_name = next(n for n in cands_ext if _FUSED_SIBLING_MARKER in n)
+    nvfp4_cand = next(c for c in cands_ext[super_name] if c.fmt == "NVFP4")
+    # Under sum: would be 1+1+1000 = 1002. Under max*3: 3000.
+    # The DP MUST see the larger number so it picks BF16 for this group.
+    assert nvfp4_cand.predicted_dloss == 3000.0, (
+        f"max-aggregation should surface the 1000-Δloss sibling × 3 = 3000; "
+        f"got {nvfp4_cand.predicted_dloss}"
+    )
 
 
 def test_expand_broadcasts_super_format_to_members():

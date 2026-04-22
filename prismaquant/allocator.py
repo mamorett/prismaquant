@@ -862,8 +862,25 @@ def aggregate_fused_siblings(
             "_memory_bytes_by_format": {},
         }
 
-        # Per-format: sum_pred = Σ predicted_dloss(h_i, mse_{i,f}).
+        # Per-format: group_pred = MAX per-sibling predicted_dloss, NOT sum.
+        #
+        # QKV/gate-up siblings receive the SAME tokens (unlike MoE experts
+        # which see disjoint token subsets). If one sibling is quality-
+        # sensitive and another is not, the group's serviceable floor is
+        # set by the sensitive one — any format that blows up the sensitive
+        # sibling blows up the whole attention/MLP block. Aggregating with
+        # `sum` averages the cost, letting the DP pick a cheap format that
+        # looks fine on the sum but destroys the sensitive sibling (observed
+        # catastrophically on 35B-A3B re-export: predicted Δloss dropped
+        # 13.5% on paper, measured perplexity went from 4 to 10 000).
+        #
+        # `max` gives the DP the correct signal: "this group can only go as
+        # low as the most-sensitive member tolerates." Matches how the
+        # legacy promote_fused post-pass behaved implicitly (it promoted to
+        # the highest-rank format, which approximates "the hardest sibling's
+        # best choice"), just baked into the DP itself.
         super_cost = {}
+        n_super_members = max(len(members), 1)
         for spec in formats:
             missing = [m for m in members
                        if spec.name not in costs.get(m, {})
@@ -871,18 +888,25 @@ def aggregate_fused_siblings(
             if missing:
                 super_cost[spec.name] = {"error": "partial"}
                 continue
-            sum_pred = 0.0
+            per_sibling_preds = []
             for m in members:
                 c = costs[m][spec.name]
                 if "predicted_dloss" in c:
-                    sum_pred += float(c["predicted_dloss"])
+                    per_sibling_preds.append(float(c["predicted_dloss"]))
                 else:
                     h_i = stats[m]["h_trace"]
-                    sum_pred += 0.5 * h_i * float(c.get("weight_mse", 0.0))
-            effective_mse = sum_pred / (0.5 * sum_h) if sum_h > 0 else 0.0
+                    per_sibling_preds.append(
+                        0.5 * h_i * float(c.get("weight_mse", 0.0)))
+            # Scale the max by n_members so the magnitude matches what the
+            # DP expects for a "super-Linear of that total param count":
+            # conceptually, "all siblings incur the hardest sibling's
+            # per-weight Δloss". Otherwise the aggregated group looks
+            # artificially cheap compared to un-aggregated singletons.
+            group_pred = max(per_sibling_preds) * n_super_members
+            effective_mse = group_pred / (0.5 * sum_h) if sum_h > 0 else 0.0
             super_cost[spec.name] = {
                 "weight_mse": effective_mse,
-                "predicted_dloss": sum_pred,
+                "predicted_dloss": group_pred,
             }
         costs_ext[super_name] = super_cost
 
