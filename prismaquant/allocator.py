@@ -868,9 +868,27 @@ def aggregate_fused_siblings(
             }
         costs_ext[super_name] = super_cost
 
+        # Super-Linear can only use a format that EVERY member supported.
+        # If a member's shape was masked out of MXFP8 (DeltaNet
+        # in_proj_a with out_features=48, for example), the fused
+        # group as a whole inherits that restriction — the super's
+        # shape equals each member's (siblings share both in and out).
+        member_format_sets = [
+            {c.fmt for c in candidates.get(m, [])}
+            for m in members
+        ]
+        if member_format_sets:
+            member_format_intersection = set.intersection(*member_format_sets)
+        else:
+            member_format_intersection = set()
+
         # Candidate list for the super-Linear.
         cands = []
         for spec in formats:
+            if spec.name not in member_format_intersection:
+                # At least one sibling had this format shape-masked —
+                # the fused group can't use it either.
+                continue
             entry = super_cost.get(spec.name)
             if entry is None or "error" in entry:
                 continue
