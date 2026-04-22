@@ -52,6 +52,12 @@ def _build_weight_map(model_path: str, *,
         # Prefix renames mirroring vLLM's `hf_to_vllm_mapper` for the
         # multimodal → text-only body remap. Order matters: more
         # specific rules first.
+        # FP8-source artifacts (MiniMax-M2.*, DeepSeek-V3 FP8) — the
+        # dequant already happened during the streaming cost/probe
+        # pass, so these input-scale buffers are orphans we must not
+        # try to install onto the re-declared bf16 Linear modules.
+        if k.endswith(".weight_scale_inv"):
+            return None
         if k.startswith("model.visual.") or k.startswith("model.audio_tower.") \
                 or k.startswith("model.vision_tower.") \
                 or k.startswith("model.embed_vision.") \
@@ -68,6 +74,8 @@ def _build_weight_map(model_path: str, *,
         # multimodal model's named modules. MTP weights follow a
         # separate synthesis path; drop them so they don't shadow
         # anything.
+        if k.endswith(".weight_scale_inv"):
+            return None
         if k.startswith("mtp."):
             return None
         return k
