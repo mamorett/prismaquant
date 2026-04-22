@@ -239,6 +239,125 @@ def annotate_probe_shard(path: Path, extra_meta: dict[str, Any]) -> None:
         pickle.dump(data, f)
 
 
+# Fields whose equality makes two shards' per-Linear Fisher stats
+# interchangeable. Notably excludes `linear_include` and `shard_idx` —
+# those describe the shard *grouping*, not the Linear-level numbers.
+# Swapping LAYERS_PER_SHARD between runs changes grouping but not
+# numbers, so probe_shard pickles are safe to pool on these axes.
+_CONTENT_META_KEYS: tuple[str, ...] = (
+    "model", "dataset", "nsamples", "seqlen", "dtype",
+    "requested_device", "requested_device_map",
+    "importance_weighting", "activation_cache_dir",
+    "linear_exclude", "h_detail_dir",
+)
+
+
+def _probe_meta_flat(raw_meta: dict[str, Any]) -> dict[str, Any]:
+    """Flatten `{meta, meta.incremental_shard}` into one dict. Shards
+    written by this module stash extra fields under
+    `meta["incremental_shard"]`; we want to see both layers at once."""
+    meta = dict(raw_meta or {})
+    meta.update(meta.get("incremental_shard") or {})
+    return meta
+
+
+def _content_meta_compatible(raw_meta: dict[str, Any],
+                             anchor: dict[str, Any]) -> bool:
+    probe_meta = _probe_meta_flat(raw_meta)
+    return all(probe_meta.get(k) == anchor.get(k) for k in _CONTENT_META_KEYS)
+
+
+def scan_cached_linear_stats(
+    shard_dir: Path,
+    content_meta_anchor: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Scan `shard_dir/probe_shard_*.pkl`. Return a flat map
+    `{linear_name: stats_dict}` pooled across all shards whose meta is
+    content-compatible with `content_meta_anchor` (matches on model,
+    dataset, nsamples, seqlen, etc — but NOT on linear_include or
+    shard_idx). First-seen wins on duplicates.
+
+    Used for LPS-invariant shard reuse: Fisher stats are intrinsic to
+    each Linear, so a shard at lps=5 (L0-L4) and a shard at lps=3
+    (L0-L2) share identical numbers for L0-L2, even though neither
+    pickle directly equals the other. We pool them at the Linear level
+    and synthesize new shards by filtering on regex.
+    """
+    pooled: dict[str, dict[str, Any]] = {}
+    if not shard_dir.exists():
+        return pooled
+    for path in sorted(shard_dir.glob("probe_shard_*.pkl")):
+        try:
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if not _content_meta_compatible(data.get("meta") or {},
+                                        content_meta_anchor):
+            continue
+        stats = data.get("stats") or {}
+        if not isinstance(stats, dict):
+            continue
+        for name, s in stats.items():
+            if name not in pooled:
+                pooled[name] = s
+    return pooled
+
+
+def synthesize_shard_from_linear_cache(
+    linear_include: str,
+    linear_exclude: str,
+    cache: dict[str, dict[str, Any]],
+    expected_meta: dict[str, Any],
+    output_path: Path,
+) -> bool:
+    """Produce `output_path` by filtering `cache` through the shard's
+    include / exclude regexes. Returns True iff any Linear matches
+    (caller decides whether to run a fresh compute for the missing
+    ones — this function doesn't attempt partial fill).
+
+    The shard's regex form is `re:<pattern>` (compressed-tensors
+    convention) or a bare pattern; we strip the optional `re:` prefix
+    before compiling. The written pickle mirrors the shape that
+    `_run_body_streaming_shard` produces so downstream consumers
+    (merge_probe_pickles, probe_shard_is_reusable) see no difference
+    between a freshly-computed and a synthesized shard."""
+    def _compile(pat: str) -> "re.Pattern":
+        p = pat[3:] if pat.startswith("re:") else pat
+        return re.compile(p)
+
+    inc = _compile(linear_include)
+    exc = _compile(linear_exclude) if linear_exclude else None
+
+    selected: dict[str, dict[str, Any]] = {}
+    for name, stats in cache.items():
+        if not inc.search(name):
+            continue
+        if exc is not None and exc.search(name):
+            continue
+        selected[name] = stats
+    if not selected:
+        return False
+
+    payload = {
+        "stats": selected,
+        "router_counts": {},
+        "router_totals": {},
+        "expert_info": {},
+        "meta": {
+            **dict(expected_meta),
+            "device_map": "streaming-layerwise",
+            "synthesized_from_cache": True,
+        },
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "wb") as f:
+        pickle.dump(payload, f)
+    return True
+
+
 def merge_probe_pickles(paths: list[Path], output_path: Path):
     merged = None
     merged_stats = {}
@@ -1487,6 +1606,36 @@ def main():
               f"{precompute_cache_path}", flush=True)
         return precomputed
 
+    # Linear-level reuse cache (LPS-invariant): union of per-Linear
+    # Fisher stats from all existing shards that share the same
+    # content-level meta (model, dataset, nsamples, seqlen, dtype,
+    # importance_weighting, activation_cache_dir). This lets the probe
+    # resume cleanly even when LAYERS_PER_SHARD changes between runs:
+    # a new shard's regex-matched Linears may already exist under
+    # different shard groupings on disk, and we can synthesize the new
+    # shard pickle from that cache rather than recompute.
+    content_meta_anchor = {
+        "model": args.model,
+        "dataset": args.dataset,
+        "nsamples": args.nsamples,
+        "seqlen": args.seqlen,
+        "dtype": args.dtype,
+        "requested_device": args.device,
+        "requested_device_map": str(args.device_map),
+        "importance_weighting": args.importance_weighting,
+        "activation_cache_dir": str(Path(args.activation_cache_dir)),
+        "linear_exclude": (
+            r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|"
+            r"block_sparse_moe\.gate$)"
+        ),
+        "h_detail_dir": (str(Path(args.h_detail_dir))
+                         if args.h_detail_dir else None),
+    }
+    linear_cache = scan_cached_linear_stats(shard_dir, content_meta_anchor)
+    if linear_cache:
+        print(f"[incremental] linear cache: {len(linear_cache)} stats pooled "
+              f"from prior shards (LPS-invariant reuse enabled)", flush=True)
+
     try:
         if not all_reusable:
             _ensure_ready()
@@ -1498,6 +1647,25 @@ def main():
                 print(f"[incremental] reuse shard {shard_idx}: {shard_path}",
                       flush=True)
                 continue
+
+            # LPS-invariant reuse: try to synthesize this shard from
+            # cached per-Linear stats pooled from other compatible
+            # shards. Skip body+lm_head+mtp kinds only — visual/empty
+            # shards don't have per-Linear stats to reuse.
+            kind_for_synth = _classify_shard(linear_include)
+            if kind_for_synth in ("body", "mtp", "lm_head") and linear_cache:
+                if synthesize_shard_from_linear_cache(
+                    linear_include=linear_include,
+                    linear_exclude=content_meta_anchor["linear_exclude"],
+                    cache=linear_cache,
+                    expected_meta=expected_meta,
+                    output_path=shard_path,
+                ):
+                    annotate_probe_shard(shard_path, expected_meta)
+                    print(f"[incremental] synthesize shard {shard_idx} "
+                          f"({kind_for_synth}): reused cached Linear stats "
+                          f"→ {shard_path}", flush=True)
+                    continue
             if shard_path.exists():
                 print(f"[incremental] stale shard {shard_idx}: "
                       f"recomputing {shard_path}", flush=True)
