@@ -720,14 +720,25 @@ def main():
         raise SystemExit(f"empty layer range: start={start} end={end}")
 
     # Resolve --layers-per-shard: int literal or "auto" (hardware-adaptive).
+    # Cost script has no --nsamples / --seqlen of its own — those belong to
+    # the probe run. Pull them from the probe pickle's meta so the autoscale
+    # memory model uses the same calibration shape that produced the probe.
     lps_arg = str(args.layers_per_shard).strip()
     if lps_arg.lower() in ("auto", ""):
         from .autoscale import pick_layers_per_shard
+        try:
+            with open(args.probe, "rb") as _f:
+                _probe_meta = (pickle.load(_f).get("meta") or {})
+        except Exception:
+            _probe_meta = {}
+        _nsamples = int(_probe_meta.get("nsamples", 32))
+        _seqlen = int(_probe_meta.get("seqlen", 1024))
         lps, lps_diag = pick_layers_per_shard(
-            args.model, nsamples=args.nsamples, seqlen=args.seqlen,
+            args.model, nsamples=_nsamples, seqlen=_seqlen,
         )
         print(f"[cost] layers_per_shard=auto -> {lps} "
-              f"(available={lps_diag.get('available_gb',0):.1f} GB, "
+              f"(nsamples={_nsamples}, seqlen={_seqlen}, "
+              f"available={lps_diag.get('available_gb',0):.1f} GB, "
               f"per_layer_active={lps_diag.get('per_layer_active_gb',0):.2f} GB)",
               flush=True)
         args.layers_per_shard = lps
