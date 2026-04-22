@@ -430,6 +430,30 @@ register_format(FormatSpec(
     activation_quantize_dequantize=_make_rtn("fp8_e5m2", 0),
 ))
 
+# Low-bit Nvidia-flavored int quantization (block=16, FP8 scale — matches
+# NVFP4's envelope for easy dequant-to-NVFP4 at serve time). These are our
+# own formats; no hardware tensor-core op exists for them, so the serving
+# path dequantizes to NVFP4 on load and runs unchanged NVFP4 GEMMs.
+# Storage savings: INT3 saves 25% vs NVFP4, INT2 saves 50%.
+register_format(FormatSpec(
+    name="NVINT3",
+    weight_bits=3, group_size=16, scale_bits=8, scale_dtype_name="fp8_e4m3",
+    weight_element_dtype="int3", act_bits=None,
+    family="nv", min_capability_sm=100,
+    autoround_config=lambda: _int_autoround(3, 16, 16),
+    quantize_dequantize=lambda w: _rtn_uniform_int(w, 3, 16),
+    activation_quantize_dequantize=lambda x: x,
+))
+register_format(FormatSpec(
+    name="NVINT2",
+    weight_bits=2, group_size=16, scale_bits=8, scale_dtype_name="fp8_e4m3",
+    weight_element_dtype="int2", act_bits=None,
+    family="nv", min_capability_sm=100,
+    autoround_config=lambda: _int_autoround(2, 16, 16),
+    quantize_dequantize=lambda w: _rtn_uniform_int(w, 2, 16),
+    activation_quantize_dequantize=lambda x: x,
+))
+
 # INT8 per-channel / INT4 per-group
 register_format(FormatSpec(
     name="INT8_W8A16",
