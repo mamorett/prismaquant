@@ -398,12 +398,23 @@ def _format_kernel_supports_shape(fmt_name: str, in_features: int,
 
     Unknown formats default to True — allocator-time should not
     silently drop experimental formats that haven't been profiled.
+
+    Both layers must accept before a shape passes. The flashinfer
+    common check covers generic dtype/alignment rules; the hand-
+    curated table captures backend-specific constraints that the
+    generic check doesn't see (e.g., CUTLASS SM121 MXFP8 requires
+    N % 128 while the common check only asks for N >= 128).
     """
-    # Layer 1: try the kernel's authoritative validator.
-    if _flashinfer_kernel_accepts(fmt_name, in_features, out_features) is not None:
-        return _flashinfer_kernel_accepts(fmt_name, in_features, out_features)
+    # Layer 1: try the kernel's authoritative validator. If it
+    # explicitly rejects, we're done — no backend will accept.
+    flashinfer_verdict = _flashinfer_kernel_accepts(
+        fmt_name, in_features, out_features)
+    if flashinfer_verdict is False:
+        return False
 
     # Layer 2: hand-curated tile-alignment fallback.
+    # Even if flashinfer's common check passed, backend-specific
+    # rules may still reject (e.g., cutlass SM121 N % 128 tile).
     if fmt_name.startswith("MXFP8"):
         # CUTLASS mm_mxfp8 (SM100/121 Blackwell):
         #   - N ≥ 128, K ≥ 128 (generic check)
