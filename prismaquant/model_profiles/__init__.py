@@ -3,6 +3,7 @@
 Exports:
   - ModelProfile: abstract base class
   - DefaultProfile: generic fallback
+  - Qwen3Profile: covers Qwen3 dense (0.6B-32B)
   - Qwen3_5Profile: covers Qwen3.5 and Qwen3.6 MoE (w/ MTP)
   - Gemma4Profile: covers Gemma 4 dense + MoE multimodal
   - MiniMaxM2Profile: covers MiniMax M2 / M2.7 MoE
@@ -13,6 +14,7 @@ from .base import ModelProfile
 from .default import DefaultProfile
 from .gemma4 import Gemma4Profile
 from .minimax_m2 import MiniMaxM2Profile
+from .qwen3 import Qwen3Profile
 from .qwen3_5 import Qwen3_5Profile
 from .qwen3_5_dense import Qwen3_5DenseProfile
 from .registry import detect_profile, register_profile
@@ -20,6 +22,7 @@ from .registry import detect_profile, register_profile
 __all__ = [
     "ModelProfile",
     "DefaultProfile",
+    "Qwen3Profile",
     "Qwen3_5Profile",
     "Qwen3_5DenseProfile",
     "Gemma4Profile",

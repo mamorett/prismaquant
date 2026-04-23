@@ -81,9 +81,6 @@ def stage_text_only(model_path: str) -> str:
         return str(src)
     with open(cfg_path) as f:
         cfg = json.load(f)
-    if not any(k in cfg for k in
-               ("vision_config", "text_config", "audio_config", "speech_config")):
-        return str(src)
 
     # Profile-driven: ask the registered ModelProfile which config keys
     # to strip and whether to promote `text_config.model_type`.
@@ -97,6 +94,17 @@ def stage_text_only(model_path: str) -> str:
                   else ["vision_config", "audio_config", "speech_config",
                         "image_token_id", "video_token_id",
                         "vision_start_token_id", "vision_end_token_id"])
+    # Run staging when either (a) the model is multimodal (has a
+    # config section that must be stripped for text-only load), or
+    # (b) any of the profile-declared strip_keys is present. The
+    # second trigger covers text-only profiles that still need to
+    # edit the staged config (e.g. strip a stale `auto_map` that
+    # points at a remote modeling file incompatible with the
+    # current transformers version).
+    if not any(k in cfg for k in
+               ("vision_config", "text_config", "audio_config", "speech_config")) \
+            and not any(k in cfg for k in strip_keys):
+        return str(src)
     promote_inner_mt = (profile.stage_text_only_promote_inner_model_type()
                         if profile is not None else False)
 

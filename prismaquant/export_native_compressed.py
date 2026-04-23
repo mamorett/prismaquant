@@ -1887,6 +1887,9 @@ def materialize_tensors_streaming(
     #       streams them in.
     staged = stage_text_only(model_path)
     config = AutoConfig.from_pretrained(staged, trust_remote_code=True)
+    # _init_weights is globally no-op'd by prismaquant.__init__'s
+    # _polyfill_transformers (wasted work + transformers-5.x compat
+    # landmine on remote modeling files).
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
             config, trust_remote_code=True)
